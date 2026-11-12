@@ -2034,7 +2034,7 @@ mod tests_handle_command {
 
         assert_eq!(failed_executions.load(Ordering::SeqCst), 3);
         assert_eq!(successful_executions.load(Ordering::SeqCst), 3);
-        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.stop_reason, StopReason::MaxTurns);
         assert_eq!(result.turns, 3);
         assert!(result.text.contains("tool is blocked"));
 

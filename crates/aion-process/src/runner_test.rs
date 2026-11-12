@@ -102,6 +102,66 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn runner_cancellation_kills_process_group() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!("aion-process-cancel-{}-{stamp}.pid", std::process::id()));
+        #[cfg(unix)]
+        let script = "sleep 10 & printf '%s' \"$!\" > \"$AION_TEST_PID_FILE\"; wait";
+        #[cfg(windows)]
+        let script = "$p = Start-Process -FilePath powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 10' -PassThru -WindowStyle Hidden; [System.IO.File]::WriteAllText($env:AION_TEST_PID_FILE, [string]$p.Id); Wait-Process -Id $p.Id";
+        let mut command = shell_command(script);
+        command.env("AION_TEST_PID_FILE", &pid_file);
+        let runner = tokio::spawn(CommandRunner::new(command).run());
+        let child_pid = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        let _ = std::fs::remove_file(&pid_file);
+        let child_pid = child_pid.expect("child should report its pid before cancellation");
+        for _ in 0..20 {
+            if !process_alive(child_pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Clean up the test child even when the regression assertion fails.
+        terminate_process(child_pid);
+        panic!("background process {child_pid} survived runner cancellation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_completed_command_keeps_background_descendant_running() {
+        let result = CommandRunner::new(shell_command("sleep 10 & echo $!"))
+            .run()
+            .await
+            .expect("runner should complete successfully");
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, Some(0));
+        let sleep_pid = String::from_utf8_lossy(&result.stdout)
+            .lines()
+            .find_map(|line| line.trim().parse::<u32>().ok())
+            .expect("script should print background sleep pid");
+        let alive = process_alive(sleep_pid);
+        terminate_process(sleep_pid);
+        assert!(alive, "normal completion must preserve intentional background work");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn runner_timeout_kills_process_group() {
@@ -251,5 +311,11 @@ mod tests {
 
         unsafe { TerminateProcess(handle, 1) };
         unsafe { CloseHandle(handle) };
+    }
+
+    #[cfg(unix)]
+    fn terminate_process(pid: u32) {
+        let target = i32::try_from(pid).unwrap();
+        unsafe { libc::kill(target, libc::SIGKILL) };
     }
 }

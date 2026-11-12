@@ -902,6 +902,13 @@ impl AgentEngine {
         counted_turns: usize,
         fallback_stop_reason: StopReason,
     ) -> Result<AgentResult, AgentError> {
+        info!(
+            target: "aion_agent",
+            finalization_reason = ?reason,
+            counted_turns,
+            turn_id = self.current_turn_id.as_deref(),
+            "finalizing agent run with tools disabled"
+        );
         let outcome = self.run_turn(TurnKind::Finalization(reason)).await?;
         let combined_text = format!("{}{}", prefix_text, outcome.assistant_text);
         let is_success = outcome.tool_calls.is_empty()
@@ -914,7 +921,11 @@ impl AgentEngine {
             self.save_session();
             return Ok(AgentResult {
                 text: combined_text,
-                stop_reason: StopReason::EndTurn,
+                // A summary explains why execution stopped; it cannot clear a guard.
+                stop_reason: match reason {
+                    FinalizationReason::ToolFailure | FinalizationReason::TurnBudget => fallback_stop_reason,
+                    FinalizationReason::MaxTokens | FinalizationReason::EmptyFinal => StopReason::EndTurn,
+                },
                 usage: self.total_usage.clone(),
                 turns: counted_turns,
             });

@@ -46,8 +46,7 @@ impl CommandRunner {
         ChildContainment::configure(&mut self.command);
 
         let mut child = self.command.spawn()?;
-        let child_id = child.id();
-        let containment = ChildContainment::attach(&mut child)?;
+        let mut containment = ChildContainment::attach(&mut child)?;
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
 
@@ -63,6 +62,9 @@ impl CommandRunner {
         match tokio::time::timeout(self.timeout, child.wait()).await {
             Ok(status) => {
                 let status = status?;
+                // Successful command completion may intentionally leave a
+                // background process running. Only in-flight cancellation kills it.
+                containment.disarm();
                 let (stdout_result, stderr_result) = tokio::join!(
                     drain_reader_with_result(stdout_reader, self.post_process_drain),
                     drain_reader_with_result(stderr_reader, self.post_process_drain)
@@ -78,7 +80,7 @@ impl CommandRunner {
                 })
             }
             Err(_) => {
-                containment.terminate(&mut child, child_id)?;
+                containment.terminate(&mut child)?;
                 if let Ok(status) = tokio::time::timeout(self.post_process_drain, child.wait()).await {
                     status?;
                 }

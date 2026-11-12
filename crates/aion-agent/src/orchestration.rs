@@ -159,6 +159,15 @@ async fn execute_single(
     if let Some(hook_engine) = hooks
         && let Err(e) = hook_engine.run_pre_tool_use(name, input).await
     {
+        tracing::warn!(
+            target: "aion_agent",
+            tool = %name,
+            call_id = %id,
+            duration_ms = start.elapsed().as_millis() as u64,
+            success = false,
+            failure_kind = "pre_tool_hook",
+            "tool execution blocked by hook"
+        );
         return (
             ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
@@ -219,13 +228,26 @@ async fn execute_single(
     // Run post-tool-use hooks
     if let Some(hook_engine) = hooks {
         let messages = hook_engine.run_post_tool_use(name, input, &result.content).await;
-        for msg in messages {
-            tracing::info!(target: "aion_agent", hook_message = %msg, "post-tool-use hook output");
+        if !messages.is_empty() {
+            tracing::debug!(
+                target: "aion_agent",
+                tool = %name,
+                call_id = %id,
+                message_count = messages.len(),
+                "post-tool-use hooks returned messages"
+            );
         }
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    tracing::info!(target: "aion_agent", duration_ms, success = !result.is_error, "tool execution completed");
+    tracing::info!(
+        target: "aion_agent",
+        tool = %name,
+        call_id = %id,
+        duration_ms,
+        success = !result.is_error,
+        "tool execution completed"
+    );
 
     (
         ContentBlock::ToolResult {

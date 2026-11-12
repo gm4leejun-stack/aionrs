@@ -946,7 +946,7 @@ async fn test_engine_token_usage_tracking() {
 // test_engine_max_turns_runs_one_grace_finalization
 //
 // Verifies that exhausting max_turns after a tool round gets one tool-disabled
-// finalization request before falling back to StopReason::MaxTurns.
+// finalization request while retaining StopReason::MaxTurns for the host.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_engine_max_turns_runs_one_grace_finalization() {
@@ -996,7 +996,7 @@ async fn test_engine_max_turns_runs_one_grace_finalization() {
         .await
         .expect("engine should succeed with grace finalization");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "Final from existing tool result");
     assert_eq!(result.turns, 1);
 
@@ -1079,7 +1079,7 @@ async fn repeated_tool_call_failure_turns_finalize_without_more_tools() {
         .await
         .expect("engine should finalize repeated tool-call-failure loops");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "The tool is blocked by permission settings.");
     assert_eq!(result.turns, 3);
 
@@ -1096,6 +1096,55 @@ async fn repeated_tool_call_failure_turns_finalize_without_more_tools() {
             )
         })
     }));
+}
+
+#[tokio::test]
+async fn recoverable_tool_failure_then_success_finishes_normally() {
+    let provider = Arc::new(FullRecordingRequestProvider::new(vec![
+        tool_call_failure_turn("failed-call"),
+        vec![
+            LlmEvent::ToolUse {
+                id: "repaired-call".into(),
+                name: "repaired_tool".into(),
+                input: json!({}),
+                extra: None,
+            },
+            LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+        ],
+        vec![
+            LlmEvent::TextDelta("Task completed after repair.".into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ],
+    ]));
+    let requests = provider.requests();
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MockTool::new("mock_tool", "invalid argument", true)));
+    registry.register(Box::new(MockTool::new("repaired_tool", "saved output", false)));
+    let mut engine =
+        AgentEngine::new_with_provider(provider, test_config(), registry, silent_output(), std::env::temp_dir());
+
+    let result = engine.run("create output", "recovery-test").await.unwrap();
+
+    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.text, "Task completed after repair.");
+    assert_eq!(result.turns, 3);
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 3);
+    assert!(recorded.iter().all(|request| request.tool_count > 0));
+    for (request_index, call_id, expected_error) in [(1, "failed-call", true), (2, "repaired-call", false)] {
+        assert!(recorded[request_index].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id, is_error, .. }
+                    if tool_use_id == call_id && *is_error == expected_error)
+            })
+        }));
+    }
 }
 
 #[tokio::test]
@@ -1125,7 +1174,7 @@ async fn repeated_tool_call_failure_threshold_one_finalizes_immediately() {
         .await
         .expect("engine should finalize repeated tool-call-failure loops");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "The tool failed because permission was denied.");
     assert_eq!(result.turns, 1);
 
@@ -1163,7 +1212,7 @@ async fn repeated_tool_call_failure_disabled_runs_grace_finalization() {
         .await
         .expect("engine should stop cleanly");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "Final after tool-call failures");
     assert_eq!(result.turns, 2);
 
@@ -1324,7 +1373,7 @@ async fn repeated_tool_call_malformed_disabled_runs_grace_finalization() {
         .await
         .expect("engine should stop cleanly");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "Final after malformed attempts");
     assert_eq!(result.turns, 2);
 
