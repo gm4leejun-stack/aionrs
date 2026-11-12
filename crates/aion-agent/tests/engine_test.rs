@@ -637,14 +637,11 @@ async fn empty_final_falls_back_after_one_empty_retry() {
     engine
         .init_session("test-provider", "/tmp", None)
         .expect("init_session should succeed");
-    let result = engine
+    let error = engine
         .run("Answer visibly", "")
         .await
-        .expect("engine should fall back successfully");
-
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
-    assert_eq!(result.turns, 2);
-    assert!(result.text.contains("finished without visible answer text"));
+        .expect_err("an empty fallback must not report success");
+    assert!(error.to_string().contains("finished without visible answer text"));
 
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded.len(), 3);
@@ -670,7 +667,7 @@ async fn empty_final_falls_back_after_one_empty_retry() {
     assert!(
         matches!(
             &last_message.content[..],
-            [ContentBlock::Text { text }] if text == &result.text
+            [ContentBlock::Text { text }] if text.contains("finished without visible answer text")
         ),
         "fallback assistant message should be text-only"
     );
@@ -748,17 +745,11 @@ async fn max_tokens_finalization_tool_call_falls_back_without_persisting_tool_us
         .init_session("test-provider", "/tmp", None)
         .expect("init_session should succeed");
 
-    let result = engine
+    let error = engine
         .run("Give me a long answer", "")
         .await
-        .expect("engine should fall back successfully");
-
-    assert_eq!(result.stop_reason, StopReason::MaxTokens);
-    assert_eq!(result.turns, 1);
-    assert!(
-        !result.text.trim().is_empty(),
-        "fallback result text should be non-empty"
-    );
+        .expect_err("an invalid finalization must not report success");
+    assert!(error.to_string().contains("token limit"));
 
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded.len(), 2);
@@ -802,7 +793,7 @@ async fn max_tokens_finalization_tool_call_falls_back_without_persisting_tool_us
     assert!(
         matches!(
             &last_message.content[..],
-            [ContentBlock::Text { text }] if text == &result.text
+            [ContentBlock::Text { text }] if !text.trim().is_empty()
         ),
         "fallback assistant message should be text-only"
     );

@@ -955,12 +955,9 @@ impl AgentEngine {
             }],
         );
         self.save_session();
-        Ok(AgentResult {
-            text: fallback_text,
-            stop_reason: fallback_stop_reason,
-            usage: self.total_usage.clone(),
-            turns: counted_turns,
-        })
+        // Persist partial work for recovery, but never turn a failed
+        // finalization into a successful host Finish event.
+        Err(AgentError::ApiError(fallback.to_string()))
     }
 
     /// Drain one provider stream into a [`StreamOutcome`].
