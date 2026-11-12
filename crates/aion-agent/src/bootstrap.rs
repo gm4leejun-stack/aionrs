@@ -63,6 +63,7 @@ pub struct AgentBootstrap {
     config: Config,
     workspace: PathBuf,
     extra_skill_dirs: Vec<PathBuf>,
+    skills: Option<Vec<SkillMetadata>>,
 
     // Output integration.
     output: Arc<dyn OutputSink>,
@@ -104,6 +105,7 @@ impl AgentBootstrap {
             config,
             workspace: PathBuf::from(workspace.into()),
             extra_skill_dirs: Vec::new(),
+            skills: None,
             output,
             provider: None,
             resume_session: None,
@@ -139,6 +141,13 @@ impl AgentBootstrap {
     /// Add extra directories to scan for skills.
     pub fn extra_skill_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.extra_skill_dirs = dirs;
+        self
+    }
+
+    /// Supply the complete host-authorized skill set instead of filesystem discovery.
+    /// An empty set disables discovery; normal skill permissions still apply.
+    pub fn skills(mut self, skills: Vec<SkillMetadata>) -> Self {
+        self.skills = Some(skills);
         self
     }
 
@@ -268,8 +277,11 @@ impl AgentBootstrap {
         servers
     }
 
-    async fn load_skills(&self, workspace: &Path, mcp_manager: Option<&McpManager>) -> Vec<SkillMetadata> {
-        load_all_skills(workspace, &self.extra_skill_dirs, false, mcp_manager).await
+    async fn load_skills(&mut self, workspace: &Path, mcp_manager: Option<&McpManager>) -> Vec<SkillMetadata> {
+        match self.skills.take() {
+            Some(skills) => skills,
+            None => load_all_skills(workspace, &self.extra_skill_dirs, false, mcp_manager).await,
+        }
     }
 
     fn configure_system_prompt(&mut self, environment: &BootstrapEnvironment, skills: &[SkillMetadata]) -> PromptUsage {

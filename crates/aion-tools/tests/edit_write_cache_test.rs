@@ -33,8 +33,6 @@ async fn read_file(tool: &ReadTool, path: &Path) {
     assert!(!r.is_error, "read failed: {}", r.content);
 }
 
-const UNCHANGED_MARKER: &str = "File unchanged since last read";
-
 // ==========================================================================
 // TC-5.4: EditTool guard and staleness detection
 // ==========================================================================
@@ -215,7 +213,7 @@ async fn tc_5_4_06_replace_all_updates_cache() {
 // TC-5.4-W: WriteTool cache update
 // ==========================================================================
 
-/// TC-5.4-W01: Write then Read returns "unchanged" (Write populates cache).
+/// TC-5.4-W01: Write then Read replays the written content.
 #[tokio::test]
 async fn tc_5_4_w01_write_then_read_dedup() {
     let dir = tempfile::tempdir().unwrap();
@@ -233,16 +231,11 @@ async fn tc_5_4_w01_write_then_read_dedup() {
     let wr = write_tool.execute(write_input).await;
     assert!(!wr.is_error, "write failed: {}", wr.content);
 
-    // Read immediately after: should return "unchanged" because Write
-    // already cached the content with the correct mtime.
+    // Write populated the cache; Read still returns self-contained content.
     let read_input = json!({ "file_path": file.to_str().unwrap() });
     let rr = read_tool.execute(read_input).await;
     assert!(!rr.is_error);
-    assert!(
-        rr.content.contains(UNCHANGED_MARKER),
-        "Read after Write should return unchanged stub, got: {}",
-        rr.content
-    );
+    assert_eq!(rr.content, "     1\twritten content");
 }
 
 /// TC-5.4-W02: Write then Edit succeeds (Write populates cache for Edit guard).
@@ -299,18 +292,11 @@ async fn tc_5_4_w03_write_overwrite_then_read() {
     });
     write_tool.execute(w2).await;
 
-    // Read: cache was updated by second Write, so should see "unchanged"
-    // (cache content matches disk content with matching mtime).
+    // Read replays the latest written version from the updated cache.
     let read_input = json!({ "file_path": file.to_str().unwrap() });
     let rr = read_tool.execute(read_input).await;
     assert!(!rr.is_error);
-    // The cache was updated by the second Write with the new content,
-    // so Read should hit the dedup path.
-    assert!(
-        rr.content.contains(UNCHANGED_MARKER),
-        "Read after second Write should dedup, got: {}",
-        rr.content
-    );
+    assert_eq!(rr.content, "     1\tversion 2");
 
     // Verify disk has version 2.
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "version 2");
@@ -320,7 +306,7 @@ async fn tc_5_4_w03_write_overwrite_then_read() {
 // Supplementary: Cross-tool interaction tests
 // ==========================================================================
 
-/// Read → Edit → Read should dedup (Edit updated the cache).
+/// Read → Edit → Read replays the updated cached content.
 #[tokio::test]
 async fn read_edit_read_dedup() {
     let dir = tempfile::tempdir().unwrap();
@@ -343,13 +329,9 @@ async fn read_edit_read_dedup() {
     let er = edit_tool.execute(edit_input).await;
     assert!(!er.is_error);
 
-    // Read again: Edit updated the cache, so Read should see "unchanged".
+    // Read again: Edit updated the cache, so Read must return the new content.
     let read_input = json!({ "file_path": file.to_str().unwrap() });
     let rr = read_tool.execute(read_input).await;
     assert!(!rr.is_error);
-    assert!(
-        rr.content.contains(UNCHANGED_MARKER),
-        "Read after Edit should dedup, got: {}",
-        rr.content
-    );
+    assert_eq!(rr.content, "     1\tALPHA beta");
 }

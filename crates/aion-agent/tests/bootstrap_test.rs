@@ -4,6 +4,36 @@ use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::output::null_sink::NullSink;
 use aion_config::compat::ProviderCompat;
 use aion_config::config::{Config, ProviderType};
+use aion_skills::frontmatter::{parse_frontmatter, parse_skill_fields};
+use aion_skills::types::{LoadedFrom, SkillSource};
+use serde_json::json;
+
+#[tokio::test]
+async fn host_supplied_skills_are_available_without_installing_global_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    let parsed = parse_frontmatter("---\nname: officecli-xlsx\ndescription: Host skill\n---\nHOST_SKILL_MARKER");
+    let skill = parse_skill_fields(
+        &parsed.frontmatter,
+        &parsed.content,
+        "officecli-xlsx",
+        SkillSource::Managed,
+        LoadedFrom::Managed,
+        Some(dir.path().to_str().unwrap()),
+    );
+    let mut result = AgentBootstrap::new(minimal_config(), dir.path().to_string_lossy(), null_output())
+        .skills(vec![skill])
+        .build()
+        .await
+        .unwrap();
+
+    let tool = result.engine.registry_mut().get("Skill").unwrap();
+    let loaded = tool.execute(json!({"skill":"officecli-xlsx"})).await;
+    assert!(!loaded.is_error, "{}", loaded.content);
+    assert!(loaded.content.contains("HOST_SKILL_MARKER"));
+    let denied = tool.execute(json!({"skill":"unselected-global-skill"})).await;
+    assert!(denied.is_error);
+    assert!(denied.content.contains("not found"));
+}
 
 fn minimal_config() -> Config {
     Config {
@@ -32,6 +62,59 @@ fn minimal_config() -> Config {
         mcp: Default::default(),
         logging: Default::default(),
     }
+}
+
+#[tokio::test]
+async fn empty_host_skill_snapshot_does_not_discover_workspace_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join(".aionrs/skills/unselected");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "UNSELECTED_MARKER").unwrap();
+    let mut result = AgentBootstrap::new(minimal_config(), dir.path().to_string_lossy(), null_output())
+        .skills(Vec::new())
+        .build()
+        .await
+        .unwrap();
+    let loaded = result
+        .engine
+        .registry_mut()
+        .get("Skill")
+        .unwrap()
+        .execute(json!({"skill":"unselected"}))
+        .await;
+    assert!(loaded.is_error);
+    assert!(!loaded.content.contains("UNSELECTED_MARKER"));
+}
+
+#[tokio::test]
+async fn host_skill_snapshot_still_enforces_deny_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let parsed = parse_frontmatter("HOST_SKILL_MARKER");
+    let skill = parse_skill_fields(
+        &parsed.frontmatter,
+        &parsed.content,
+        "blocked",
+        SkillSource::Managed,
+        LoadedFrom::Managed,
+        Some(dir.path().to_str().unwrap()),
+    );
+    let mut config = minimal_config();
+    config.tools.auto_approve = true;
+    config.tools.skills.deny = vec!["blocked".into()];
+    let mut result = AgentBootstrap::new(config, dir.path().to_string_lossy(), null_output())
+        .skills(vec![skill])
+        .build()
+        .await
+        .unwrap();
+    let loaded = result
+        .engine
+        .registry_mut()
+        .get("Skill")
+        .unwrap()
+        .execute(json!({"skill":"blocked"}))
+        .await;
+    assert!(loaded.is_error);
+    assert!(loaded.content.contains("denied"));
 }
 
 fn null_output() -> Arc<dyn aion_agent::output::OutputSink> {

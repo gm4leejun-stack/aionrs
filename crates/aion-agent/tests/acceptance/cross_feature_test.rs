@@ -78,14 +78,10 @@ async fn tc_ax_01_multi_feature_collaboration() {
     assert!(!r1.is_error, "first read should succeed");
     assert!(r1.content.contains("line one"), "first read should return file content");
 
-    // Second read: dedup stub (file unchanged)
+    // Second read replays content, independent of earlier model context.
     let r2 = read_tool.execute(input).await;
     assert!(!r2.is_error, "second read should succeed");
-    assert!(
-        r2.content.contains("unchanged since last read"),
-        "second read should return dedup stub, got: {}",
-        r2.content
-    );
+    assert_eq!(r2.content, r1.content);
 
     // ── Step 4: Microcompact clears old tool results ──
     let mut messages = Vec::new();

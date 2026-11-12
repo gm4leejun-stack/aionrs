@@ -114,7 +114,7 @@ mod tests {
     // -- Dedup tests (with cache) --
 
     #[tokio::test]
-    async fn dedup_returns_stub_on_unchanged_file() {
+    async fn cached_read_replays_content_when_previous_result_is_unavailable() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("dedup.txt");
         std::fs::write(&file_path, "hello\n").unwrap();
@@ -129,10 +129,10 @@ mod tests {
         assert!(!r1.is_error);
         assert!(r1.content.contains("hello"));
 
-        // Second read: dedup stub.
+        // The caller may have compacted the previous result out of its context.
         let r2 = tool.execute(input).await;
         assert!(!r2.is_error);
-        assert_eq!(r2.content, FILE_UNCHANGED_STUB);
+        assert_eq!(r2.content, r1.content);
     }
 
     #[tokio::test]
@@ -189,7 +189,7 @@ mod tests {
         let r2 = tool.execute(input2).await;
         assert!(!r2.is_error);
         assert!(r2.content.contains("line 11"));
-        assert!(!r2.content.contains(FILE_UNCHANGED_STUB));
+        assert!(r2.content.contains("line 20"));
     }
 
     #[tokio::test]
@@ -206,7 +206,7 @@ mod tests {
 
         let r2 = tool.execute(input).await;
         assert!(r2.content.contains("data"));
-        assert_ne!(r2.content, FILE_UNCHANGED_STUB);
+        assert_eq!(r2.content, r1.content);
     }
 
     #[tokio::test]
@@ -239,6 +239,6 @@ mod tests {
 
         let r2 = tool.execute(input).await;
         assert!(!r2.is_error);
-        assert_eq!(r2.content, FILE_UNCHANGED_STUB);
+        assert!(r2.content.is_empty());
     }
 }

@@ -20,10 +20,9 @@ fn make_cache() -> Arc<RwLock<FileStateCache>> {
 
 /// TC-A5-01: Read dedup (LOCAL, no LLM).
 ///
-/// Verifies that a second read of an unchanged file returns a short dedup stub
-/// instead of re-sending the full content.
+/// Verifies that an unchanged file remains readable after context compaction.
 #[tokio::test]
-async fn read_dedup_returns_stub_on_second_read() {
+async fn cached_read_replays_content_on_second_read() {
     let cache = make_cache();
     let read_tool = ReadTool::new(Some(cache.clone()));
 
@@ -46,14 +45,10 @@ async fn read_dedup_returns_stub_on_second_read() {
     assert!(r1.content.contains("2\tline two"), "first read should contain line 2");
     assert!(r1.content.contains("3\tline three"), "first read should contain line 3");
 
-    // Second read WITHOUT modifying the file: should return dedup stub.
+    // Second read must be self-contained even if the earlier result was cleared.
     let r2 = read_tool.execute(input).await;
     assert!(!r2.is_error, "second read should succeed: {}", r2.content);
-    assert!(
-        r2.content.contains("unchanged since last read"),
-        "second read should return dedup stub, got: {}",
-        r2.content
-    );
+    assert_eq!(r2.content, r1.content);
 }
 
 /// TC-A5-02: Write -> Edit chain (LOCAL, no LLM).

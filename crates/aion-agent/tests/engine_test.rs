@@ -25,6 +25,60 @@ fn silent_output() -> Arc<dyn OutputSink> {
     Arc::new(TerminalSink::new(true))
 }
 
+#[tokio::test]
+async fn compaction_does_not_hide_unseen_results_from_a_large_tool_round() {
+    use aion_agent::bootstrap::AgentBootstrap;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("sales.csv");
+    std::fs::write(&input, "month,revenue\n2026-01,3600\n").unwrap();
+    let mut first_round: Vec<_> = (0..12)
+        .map(|i| LlmEvent::ToolUse {
+            id: format!("read-{i}"),
+            name: "Read".into(),
+            input: json!({"file_path": input}),
+            extra: None,
+        })
+        .collect();
+    first_round.push(LlmEvent::Done {
+        stop_reason: StopReason::ToolUse,
+        usage: TokenUsage::default(),
+    });
+    let provider = Arc::new(RecordingRequestProvider::new(vec![
+        first_round,
+        vec![
+            LlmEvent::TextDelta("done".into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ],
+    ]));
+    let requests = provider.requests();
+    let mut config = test_config();
+    config.tools.auto_approve = true;
+    config.compact.micro_keep_recent = 2;
+    let mut result = AgentBootstrap::new(config, dir.path().to_string_lossy(), silent_output())
+        .provider(provider)
+        .build()
+        .await
+        .unwrap();
+
+    result.engine.run("read all data", "test").await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    let results: Vec<_> = requests[1]
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 12);
+    assert!(results.iter().all(|content| content.contains("2026-01,3600")));
+}
+
 fn tool_call_malformed_turn(id: &str, name: &str, input: Value) -> Vec<LlmEvent> {
     vec![
         LlmEvent::ToolUse {

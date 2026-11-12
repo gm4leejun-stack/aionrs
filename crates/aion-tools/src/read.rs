@@ -11,18 +11,12 @@ use aion_types::tool::{JsonSchema, ToolResult};
 use crate::Tool;
 use crate::file_cache::{FileStateCache, file_mtime_ms};
 
-/// Stub returned when a file has not changed since the model last read it.
-/// Saves tokens by avoiding re-sending identical content.
-const FILE_UNCHANGED_STUB: &str = "File unchanged since last read. The content from the earlier Read \
-     tool_result in this conversation is still current — refer to that \
-     instead of re-reading.";
-
 pub struct ReadTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
 }
 
 impl ReadTool {
-    /// Create a ReadTool with optional file state cache for dedup.
+    /// Create a ReadTool with an optional file state cache.
     ///
     /// Pass `None` to disable caching (all reads return full content).
     pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>) -> Self {
@@ -85,8 +79,7 @@ impl Tool for ReadTool {
         // Get file mtime for dedup and cache.
         let mtime_ms = file_mtime_ms(Path::new(file_path));
 
-        // Dedup check: if cache has the same file with matching offset/limit and mtime,
-        // return a short stub instead of full content.
+        // Replay cached content: earlier results may no longer be in model context.
         if let (Some(cache_arc), Some(current_mtime)) = (&self.file_cache, mtime_ms)
             && let Ok(mut cache) = cache_arc.write()
             && let Some(cached) = cache.get(Path::new(file_path))
@@ -95,7 +88,7 @@ impl Tool for ReadTool {
             && cached.mtime_ms == current_mtime
         {
             return ToolResult {
-                content: FILE_UNCHANGED_STUB.to_string(),
+                content: cached.content.clone(),
                 is_error: false,
             };
         }
