@@ -18,6 +18,33 @@ mod tests {
         Arc::new(RwLock::new(FileStateCache::new(&config)))
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn uncached_read_yields_before_filesystem_work() {
+        use std::task::Poll;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello\n").unwrap();
+        let tool = ReadTool::new(None);
+        let mut read = Box::pin(tool.execute(json!({"file_path": file_path})));
+        let yielded = std::future::poll_fn(|cx| Poll::Ready(matches!(read.as_mut().poll(cx), Poll::Pending))).await;
+        assert!(yielded, "file reads must not block the async runtime");
+        assert!(read.await.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn oversized_offset_and_limit_do_not_overflow() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello\n").unwrap();
+        let tool = ReadTool::new(None);
+        let result = tool
+            .execute(json!({"file_path": file_path, "offset": usize::MAX, "limit": usize::MAX}))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.is_empty());
+    }
+
     // -- Basic read tests (no cache) --
 
     #[tokio::test]
