@@ -2334,7 +2334,7 @@ mod tests_loop_helpers {
         let mut guards = TurnGuards::new(Some(100), 3, DEFAULT_MAX_TOOL_CALL_FAILURE);
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
@@ -2347,11 +2347,21 @@ mod tests_loop_helpers {
     }
 
     #[test]
+    fn after_tool_round_warns_on_first_tool_failure() {
+        let mut guards = TurnGuards::new(Some(100), 3, DEFAULT_MAX_TOOL_CALL_FAILURE);
+
+        assert!(matches!(
+            guards.after_tool_round(None, failed_exec_fingerprint(), true),
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+        ));
+    }
+
+    #[test]
     fn after_tool_round_resets_tool_call_failure_streak_on_success() {
         let mut guards = TurnGuards::new(Some(100), 3, DEFAULT_MAX_TOOL_CALL_FAILURE);
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
         // A non-error tool round resets the streak.
         assert!(matches!(
@@ -2363,7 +2373,7 @@ mod tests_loop_helpers {
         // So a single subsequent tool-call-failure round must not trip the breaker.
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
     }
 
@@ -2373,7 +2383,7 @@ mod tests_loop_helpers {
 
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), false),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), false),
@@ -2398,7 +2408,7 @@ mod tests_loop_helpers {
 
             assert!(matches!(
                 guards.after_tool_round(None, fingerprint, true),
-                TurnGuardAction::Continue
+                TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
             ));
             assert_eq!(guards.tool_call_failure_count(), 1);
         }
@@ -2417,6 +2427,14 @@ mod tests_loop_helpers {
             let action = guards.after_tool_round(None, fingerprint, true);
 
             match index {
+                1 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
+                2 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
                 3 => assert!(matches!(
                     action,
                     TurnGuardAction::Warn(ToolLoopWarning::AllErrorRounds { count: 3, limit: 8 })
@@ -2444,6 +2462,14 @@ mod tests_loop_helpers {
             let action = guards.after_tool_round(None, fingerprint, true);
 
             match index {
+                0 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
+                1 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
                 2 => assert!(matches!(
                     action,
                     TurnGuardAction::Warn(ToolLoopWarning::AllErrorRounds { .. })
