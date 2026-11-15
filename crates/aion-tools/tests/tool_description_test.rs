@@ -143,6 +143,19 @@ fn edit_description_mentions_replace_all() {
     );
 }
 
+#[test]
+fn edit_description_documents_exact_input_parameters() {
+    let tool = EditTool::new(None);
+    let desc = tool.description();
+    for parameter in ["file_path", "old_string", "new_string", "replace_all"] {
+        assert!(desc.contains(parameter), "Edit description should document {parameter}");
+    }
+    assert!(
+        desc.contains("cmd"),
+        "Edit description should distinguish ExecCommand's cmd parameter"
+    );
+}
+
 // --- TC-4.2-04: Write tool description contains operation semantics ---
 
 #[test]

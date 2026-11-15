@@ -141,6 +141,8 @@ impl Tool for EditTool {
     fn description(&self) -> &str {
         "Performs exact string replacements in files.\n\n\
          Usage:\n\
+         - Input parameters are file_path, old_string, new_string, and optional replace_all.\n\
+         - Do not pass cmd to Edit; cmd belongs to ExecCommand.\n\
          - You must use the Read tool first before editing a file.\n\
          - The old_string must be unique in the file. If multiple matches exist, \
          the edit will fail. Provide more surrounding context to make it unique, \
@@ -181,8 +183,13 @@ impl Tool for EditTool {
 
     async fn execute(&self, input: Value) -> ToolResult {
         let Some(file_path) = input["file_path"].as_str() else {
+            let guidance = if input.get("cmd").is_some() {
+                " The input contains `cmd`, which belongs to ExecCommand, not Edit. Use Edit with `file_path`, `old_string`, and `new_string`."
+            } else {
+                " Edit requires `file_path`, `old_string`, and `new_string`."
+            };
             return ToolResult {
-                content: "Missing required parameter: file_path".to_string(),
+                content: format!("Missing required parameter: file_path.{guidance}"),
                 is_error: true,
             };
         };

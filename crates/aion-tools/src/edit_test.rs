@@ -70,6 +70,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_missing_file_path_with_cmd_explains_tool_parameter_mismatch() {
+        let tool = EditTool::new(None);
+        let result = tool
+            .execute(json!({
+                "cmd": "python3 -c 'print(1)'"
+            }))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("ExecCommand"), "got: {}", result.content);
+        assert!(result.content.contains("file_path"), "got: {}", result.content);
+        assert!(result.content.contains("old_string"), "got: {}", result.content);
+        assert!(result.content.contains("new_string"), "got: {}", result.content);
+    }
+
+    #[tokio::test]
     async fn test_edit_preserves_surrounding() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
