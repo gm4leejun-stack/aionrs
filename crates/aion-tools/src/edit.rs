@@ -114,6 +114,16 @@ fn convert_line_endings(text: &str, line_ending: LineEnding) -> Cow<'_, str> {
     }
 }
 
+fn decode_escaped_text(text: &str) -> Option<String> {
+    if !text.contains('\\') {
+        return None;
+    }
+
+    serde_json::from_str::<String>(&format!("\"{text}\""))
+        .ok()
+        .filter(|decoded| decoded != text)
+}
+
 pub struct EditTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
 }
@@ -253,8 +263,28 @@ impl Tool for EditTool {
 
         // Prefer the exact bytes supplied by the caller. Only fall back to an
         // EOL-adapted old_string when the exact form is absent.
+        let decoded_old_string = decode_escaped_text(old_string);
         let selected = match select_old_string(&content, old_string) {
             Ok(selected) => selected,
+            Err(MatchSelectionError::NotFound) if decoded_old_string.is_some() => {
+                match select_old_string(&content, decoded_old_string.as_deref().unwrap_or_default()) {
+                    Ok(selected) => selected,
+                    Err(MatchSelectionError::NotFound) => {
+                        return ToolResult {
+                            content: "old_string not found in file".to_string(),
+                            is_error: true,
+                        };
+                    }
+                    Err(MatchSelectionError::AmbiguousLineEndings) => {
+                        return ToolResult {
+                            content: "Ambiguous line-ending match: old_string matches both LF and CRLF text. \
+                                      Provide more surrounding context."
+                                .to_string(),
+                            is_error: true,
+                        };
+                    }
+                }
+            }
             Err(MatchSelectionError::NotFound) => {
                 return ToolResult {
                     content: "old_string not found in file".to_string(),

@@ -106,6 +106,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_accepts_json_escaped_multiline_old_string() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("escaped.txt");
+        std::fs::write(&file_path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let tool = EditTool::new(None);
+        let result = tool
+            .execute(json!({
+                "file_path": file_path.to_str().unwrap(),
+                "old_string": "alpha\\nbeta",
+                "new_string": "alpha\nbeta updated"
+            }))
+            .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha\nbeta updated\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
     async fn edit_lf_multiline_strings_preserve_crlf_file_endings() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("crlf.txt");
