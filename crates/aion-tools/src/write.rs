@@ -38,6 +38,7 @@ impl Tool for WriteTool {
     fn description(&self) -> &str {
         "Writes content to a file, creating parent directories if needed.\n\n\
          Usage:\n\
+         - `content` is the literal file content to write; do not include shell commands such as `test -f ... && python3 ...` in the file unless they are intentionally part of the file.\n\
          - This tool overwrites the existing file completely (not append).\n\
          - If the file already exists, you must use Read first to see its current content.\n\
          - Prefer Edit over Write for modifying existing files — Edit only sends the diff.\n\

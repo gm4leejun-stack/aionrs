@@ -188,6 +188,17 @@ fn write_description_prefers_edit() {
     );
 }
 
+#[test]
+fn write_description_separates_file_content_from_shell_commands() {
+    let tool = WriteTool::new(None);
+    let desc = tool.description();
+    assert!(desc.contains("content"));
+    assert!(
+        desc.contains("shell") || desc.contains("command"),
+        "Write description should clarify that content is file content, not a shell command"
+    );
+}
+
 // --- TC-4.2-05: Glob tool description contains result limits ---
 
 #[test]
