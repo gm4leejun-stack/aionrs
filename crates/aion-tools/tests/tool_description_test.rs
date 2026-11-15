@@ -64,6 +64,15 @@ fn exec_command_description_contains_parallel_guidance() {
 }
 
 #[test]
+fn exec_command_description_requires_diagnosis_before_retrying_failures() {
+    let tool = ExecCommandTool::new(test_cwd());
+    let desc = tool.description().to_lowercase();
+    assert!(desc.contains("fails") || desc.contains("failed") || desc.contains("failure"));
+    assert!(desc.contains("retry") || desc.contains("re-run") || desc.contains("again"));
+    assert!(desc.contains("traceback") || desc.contains("error"));
+}
+
+#[test]
 fn exec_command_schema_uses_cmd_and_optional_shell() {
     let tool = ExecCommandTool::new(test_cwd());
     let schema = tool.input_schema();

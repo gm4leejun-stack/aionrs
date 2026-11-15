@@ -63,6 +63,7 @@ impl Tool for ExecCommandTool {
          - Edit files: use Edit (not sed or awk)\n\
          - Write files: use Write (not echo or cat with heredoc)\n\n\
          # Instructions\n\
+         - After a command fails, inspect its complete error or traceback and diagnose the cause before retrying. Do not repeat an unchanged failing command.\n\
          - Use absolute paths to avoid working directory confusion.\n\
          - When issuing multiple independent commands, make parallel tool calls \
          instead of chaining them. Use `&&` only when commands depend on each other.\n\
