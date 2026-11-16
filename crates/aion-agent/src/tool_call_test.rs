@@ -124,6 +124,37 @@ mod tests {
     }
 
     #[test]
+    fn repairs_unambiguous_edit_command_misroute_to_exec_command() {
+        let call = ContentBlock::ToolUse {
+            id: "call-1".into(),
+            name: "Edit".into(),
+            input: json!({ "cmd": "python3 -m py_compile report.py", "timeout": 120000 }),
+            extra: None,
+        };
+
+        let repaired = repair_tool_call(call).expect("unambiguous misroute should be repaired");
+        assert!(matches!(
+            repaired,
+            ContentBlock::ToolUse { name, input, .. }
+                if name == "ExecCommand"
+                    && input["cmd"] == "python3 -m py_compile report.py"
+                    && input["timeout"] == 120000
+        ));
+    }
+
+    #[test]
+    fn leaves_ambiguous_edit_inputs_unmodified() {
+        let call = ContentBlock::ToolUse {
+            id: "call-2".into(),
+            name: "Edit".into(),
+            input: json!({ "cmd": "echo hi", "file_path": "report.py", "old_string": "x", "new_string": "y" }),
+            extra: None,
+        };
+
+        assert!(repair_tool_call(call).is_none());
+    }
+
+    #[test]
     fn all_error_round_tracker_counts_consecutive_rounds_and_resets_on_progress() {
         let mut tracker = ToolCallAllErrorRoundTracker::new(3);
 

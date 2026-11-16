@@ -248,6 +248,31 @@ pub(crate) struct ToolCallFailureTracker {
     limit: usize,
 }
 
+/// Repair only the unambiguous case where a model sends an ExecCommand-shaped
+/// payload to Edit. Any edit fields make the input ambiguous and are left
+/// untouched so the normal Edit contract error remains visible.
+pub(crate) fn repair_tool_call(call: ContentBlock) -> Option<ContentBlock> {
+    let ContentBlock::ToolUse { id, name, input, extra } = call else {
+        return None;
+    };
+
+    if name != "Edit"
+        || input.get("cmd").and_then(|value| value.as_str()).is_none()
+        || ["file_path", "old_string", "new_string", "replace_all"]
+            .iter()
+            .any(|key| input.get(*key).is_some())
+    {
+        return None;
+    }
+
+    Some(ContentBlock::ToolUse {
+        id,
+        name: "ExecCommand".to_string(),
+        input,
+        extra,
+    })
+}
+
 impl ToolCallFailureTracker {
     pub(crate) fn new(limit: usize) -> Self {
         Self {

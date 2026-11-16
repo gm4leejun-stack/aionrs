@@ -24,8 +24,8 @@ use crate::session::{Session, SessionManager};
 use crate::stream::StreamOutcome;
 use crate::tool_call::{
     DEFAULT_MAX_TOOL_CALL_FAILURE, DEFAULT_MAX_TOOL_CALL_MALFORMED, ToolCallFailureFingerprint,
-    ToolCallMalformedFingerprint, merge_tool_results, tool_call_failure_fingerprint, tool_call_malformed_fingerprint,
-    tool_call_malformed_reason,
+    ToolCallMalformedFingerprint, merge_tool_results, repair_tool_call, tool_call_failure_fingerprint,
+    tool_call_malformed_fingerprint, tool_call_malformed_reason,
 };
 use crate::tool_policy::ToolPolicy;
 use crate::turn::{FinalizationReason, ToolLoopWarning, TurnGuardAction, TurnGuards, TurnKind, TurnOutcome};
@@ -981,6 +981,26 @@ impl AgentEngine {
                     assistant_text.push_str(&text);
                 }
                 LlmEvent::ToolUse { id, name, input, extra } => {
+                    let raw_call = ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        extra: extra.clone(),
+                    };
+                    let repaired_call = repair_tool_call(raw_call);
+                    let (id, name, input, extra) = match repaired_call {
+                        Some(ContentBlock::ToolUse { id, name, input, extra }) => {
+                            warn!(
+                                target: "aion_agent",
+                                tool_use_id = %id,
+                                original_tool = "Edit",
+                                repaired_tool = %name,
+                                "repaired unambiguous tool-call parameter misroute"
+                            );
+                            (id, name, input, extra)
+                        }
+                        _ => (id, name, input, extra),
+                    };
                     if id.trim().is_empty() {
                         error!(
                             target: "aion_agent",
