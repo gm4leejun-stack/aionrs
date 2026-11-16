@@ -217,9 +217,18 @@ impl AgentBootstrap {
         let file_cache = self.build_file_cache();
         let mut registry = ToolRegistry::new();
 
-        registry.register(Box::new(ReadTool::new(file_cache.clone())));
-        registry.register(Box::new(WriteTool::new(file_cache.clone())));
-        registry.register(Box::new(EditTool::new(file_cache)));
+        registry.register(Box::new(ReadTool::new_in_workspace(
+            file_cache.clone(),
+            workspace_path.to_path_buf(),
+        )));
+        registry.register(Box::new(WriteTool::new_in_workspace(
+            file_cache.clone(),
+            workspace_path.to_path_buf(),
+        )));
+        registry.register(Box::new(EditTool::new_in_workspace(
+            file_cache,
+            workspace_path.to_path_buf(),
+        )));
         registry.register(Box::new(ExecCommandTool::new_with_env(
             workspace_path.to_path_buf(),
             self.runtime_env.clone(),

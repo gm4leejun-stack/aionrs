@@ -6,6 +6,21 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn edit_rejects_path_outside_workspace() {
+        let dir = tempdir().unwrap();
+        let tool = EditTool::new_in_workspace(None, dir.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "/tmp/outside.txt",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("outside the workspace"));
+    }
+
     use crate::file_cache::update_cache_after_write;
     use aion_config::file_cache::FileCacheConfig;
 

@@ -204,9 +204,9 @@ fn effective_child_tool_policy(parent: &ToolPolicy, allowed_tools: &[String]) ->
 
 fn build_tool_registry(policy: &ToolPolicy, cwd: &Path, runtime_env: &[(String, String)]) -> ToolRegistry {
     let all_tools: Vec<(&str, Box<dyn aion_tools::Tool>)> = vec![
-        ("Read", Box::new(ReadTool::new(None))),
-        ("Write", Box::new(WriteTool::new(None))),
-        ("Edit", Box::new(EditTool::new(None))),
+        ("Read", Box::new(ReadTool::new_in_workspace(None, cwd.to_path_buf()))),
+        ("Write", Box::new(WriteTool::new_in_workspace(None, cwd.to_path_buf()))),
+        ("Edit", Box::new(EditTool::new_in_workspace(None, cwd.to_path_buf()))),
         (
             "ExecCommand",
             Box::new(ExecCommandTool::new_with_env(cwd.to_path_buf(), runtime_env.to_vec())),

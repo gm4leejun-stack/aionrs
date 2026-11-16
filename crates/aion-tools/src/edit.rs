@@ -10,6 +10,7 @@ use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
 use crate::file_cache::{FileStateCache, file_mtime_ms, update_cache_after_write};
+use crate::workspace_path::is_within_workspace;
 
 #[derive(Clone, Copy)]
 enum LineEnding {
@@ -126,6 +127,7 @@ fn decode_escaped_text(text: &str) -> Option<String> {
 
 pub struct EditTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl EditTool {
@@ -138,7 +140,24 @@ impl EditTool {
     ///
     /// Pass `None` to disable all cache-related guards (legacy behavior).
     pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>) -> Self {
-        Self { file_cache }
+        Self {
+            file_cache,
+            workspace: None,
+        }
+    }
+
+    pub fn new_in_workspace(file_cache: Option<Arc<RwLock<FileStateCache>>>, workspace: std::path::PathBuf) -> Self {
+        Self {
+            file_cache,
+            workspace: Some(workspace),
+        }
+    }
+
+    fn allowed_path(&self, file_path: &str) -> bool {
+        let Some(workspace) = &self.workspace else {
+            return true;
+        };
+        is_within_workspace(workspace, Path::new(file_path))
     }
 }
 
@@ -215,6 +234,12 @@ impl Tool for EditTool {
                 is_error: true,
             };
         };
+        if !self.allowed_path(file_path) {
+            return ToolResult {
+                content: format!("Path is outside the workspace and is not allowed: {file_path}"),
+                is_error: true,
+            };
+        }
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
 
         let path = Path::new(file_path);

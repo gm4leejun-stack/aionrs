@@ -13,9 +13,11 @@ use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
 use crate::file_cache::{FileStateCache, file_mtime_ms};
+use crate::workspace_path::is_within_workspace;
 
 pub struct ReadTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl ReadTool {
@@ -23,7 +25,24 @@ impl ReadTool {
     ///
     /// Pass `None` to disable caching (all reads return full content).
     pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>) -> Self {
-        Self { file_cache }
+        Self {
+            file_cache,
+            workspace: None,
+        }
+    }
+
+    pub fn new_in_workspace(file_cache: Option<Arc<RwLock<FileStateCache>>>, workspace: std::path::PathBuf) -> Self {
+        Self {
+            file_cache,
+            workspace: Some(workspace),
+        }
+    }
+
+    fn allowed_path(&self, file_path: &str) -> bool {
+        let Some(workspace) = &self.workspace else {
+            return true;
+        };
+        is_within_workspace(workspace, Path::new(file_path))
     }
 
     fn read_file(&self, file_path: &str, offset: Option<usize>, limit: Option<usize>) -> ToolResult {
@@ -134,6 +153,12 @@ impl Tool for ReadTool {
                 is_error: true,
             };
         };
+        if !self.allowed_path(file_path) {
+            return ToolResult {
+                content: format!("Path is outside the workspace and is not allowed: {file_path}"),
+                is_error: true,
+            };
+        }
 
         let offset = input["offset"].as_u64().map(|v| v as usize);
         let limit = input["limit"].as_u64().map(|v| v as usize);
