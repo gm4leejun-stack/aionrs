@@ -64,6 +64,7 @@ pub struct AgentBootstrap {
     workspace: PathBuf,
     extra_skill_dirs: Vec<PathBuf>,
     skills: Option<Vec<SkillMetadata>>,
+    isolate_skill_dirs: bool,
 
     // Output integration.
     output: Arc<dyn OutputSink>,
@@ -107,6 +108,7 @@ impl AgentBootstrap {
             workspace: PathBuf::from(workspace.into()),
             extra_skill_dirs: Vec::new(),
             skills: None,
+            isolate_skill_dirs: false,
             output,
             provider: None,
             resume_session: None,
@@ -157,6 +159,16 @@ impl AgentBootstrap {
     /// An empty set disables discovery; normal skill permissions still apply.
     pub fn skills(mut self, skills: Vec<SkillMetadata>) -> Self {
         self.skills = Some(skills);
+        self
+    }
+
+    /// Discover skills only from the supplied directories and bundled skills.
+    ///
+    /// Each directory is interpreted as a project root containing
+    /// `.aionrs/skills`.
+    pub fn isolated_skill_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.extra_skill_dirs = dirs;
+        self.isolate_skill_dirs = true;
         self
     }
 
@@ -300,7 +312,7 @@ impl AgentBootstrap {
     async fn load_skills(&mut self, workspace: &Path, mcp_manager: Option<&McpManager>) -> Vec<SkillMetadata> {
         match self.skills.take() {
             Some(skills) => skills,
-            None => load_all_skills(workspace, &self.extra_skill_dirs, false, mcp_manager).await,
+            None => load_all_skills(workspace, &self.extra_skill_dirs, self.isolate_skill_dirs, mcp_manager).await,
         }
     }
 

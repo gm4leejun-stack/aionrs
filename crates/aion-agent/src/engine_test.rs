@@ -12,15 +12,18 @@ mod tests_set_config {
     use std::sync::{Arc, Mutex};
 
     use aion_config::compat::ReasoningCompat;
+    use aion_config::config::{CliArgs, CompactContextWindowSource, Config};
     use aion_providers::error::ProviderError;
     use aion_providers::provider::LlmProvider;
     use aion_tools::registry::ToolRegistry;
     use aion_types::llm::{LlmEvent, LlmRequest};
     use aion_types::message::ImageInputCapability;
+    use tempfile::tempdir;
 
     use super::{CompactLevel, ProviderCompat};
     use crate::confirm::ToolConfirmer;
     use crate::output::OutputSink;
+    use crate::session::SessionManager;
 
     struct NullOutput;
     impl OutputSink for NullOutput {
@@ -72,6 +75,7 @@ mod tests_set_config {
             approval_manager: None,
             protocol_writer: None,
             compact_config: aion_config::compact::CompactConfig::default(),
+            compact_context_window_source: CompactContextWindowSource::Default,
             compact_state: super::CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
@@ -90,6 +94,38 @@ mod tests_set_config {
         engine
     }
 
+    fn make_resolved_openai_engine(model: &str, project_toml: &str) -> super::AgentEngine {
+        let directory = tempdir().unwrap();
+        if !project_toml.is_empty() {
+            std::fs::write(directory.path().join(".aionrs.toml"), project_toml).unwrap();
+        }
+        let config = Config::resolve(&CliArgs {
+            provider: Some("openai".into()),
+            api_key: Some("test-key".into()),
+            base_url: Some("https://api.openai.com/v1".into()),
+            model: Some(model.into()),
+            max_tokens: None,
+            thinking: None,
+            thinking_budget: None,
+            max_turns: None,
+            max_tool_call_malformed_turns: None,
+            max_tool_call_failure_turns: None,
+            system_prompt: None,
+            profile: None,
+            auto_approve: false,
+            project_dir: Some(directory.path().to_path_buf()),
+        })
+        .unwrap();
+
+        super::AgentEngine::new_with_provider(
+            Arc::new(NullProvider),
+            config,
+            ToolRegistry::new(),
+            Arc::new(NullOutput),
+            directory.path().to_path_buf(),
+        )
+    }
+
     // --- Cycle 1 tests (updated signature) ---
 
     #[test]
@@ -100,6 +136,78 @@ mod tests_set_config {
         assert_eq!(changes.len(), 1);
         assert!(changes[0].contains("old-model"));
         assert!(changes[0].contains("new-model"));
+    }
+
+    #[test]
+    fn set_config_model_change_recomputes_catalog_context_window() {
+        let mut engine = make_resolved_openai_engine("gpt-5", "");
+
+        let changes = engine.apply_config_update(Some("gpt-5.6-sol".into()), None, None, None, None, None);
+
+        assert_eq!(engine.compact_config.context_window, 1_050_000);
+        assert_eq!(
+            engine.compact_context_window_source,
+            CompactContextWindowSource::ModelCatalog
+        );
+        assert!(changes.iter().any(|change| change.contains("context window")));
+    }
+
+    #[test]
+    fn set_config_model_change_preserves_explicit_context_window() {
+        let mut engine = make_resolved_openai_engine(
+            "gpt-5",
+            r#"
+[compact]
+context_window = 200000
+"#,
+        );
+
+        let changes = engine.apply_config_update(Some("gpt-5.6-sol".into()), None, None, None, None, None);
+
+        assert_eq!(engine.compact_config.context_window, 200_000);
+        assert_eq!(
+            engine.compact_context_window_source,
+            CompactContextWindowSource::Explicit
+        );
+        assert!(!changes.iter().any(|change| change.contains("context window")));
+    }
+
+    #[test]
+    fn set_config_model_change_can_leave_and_reenter_catalog() {
+        let mut engine = make_engine_with_compat("gpt-5.6-sol", ProviderCompat::openai_defaults());
+        engine.compact_config.context_window = 1_050_000;
+        engine.compact_context_window_source = CompactContextWindowSource::ModelCatalog;
+
+        engine.apply_config_update(Some("unknown-model".into()), None, None, None, None, None);
+        assert_eq!(engine.compact_config.context_window, 200_000);
+        assert_eq!(
+            engine.compact_context_window_source,
+            CompactContextWindowSource::Default
+        );
+
+        engine.apply_config_update(Some("gpt-5".into()), None, None, None, None, None);
+        assert_eq!(engine.compact_config.context_window, 400_000);
+        assert_eq!(
+            engine.compact_context_window_source,
+            CompactContextWindowSource::ModelCatalog
+        );
+    }
+
+    #[test]
+    fn set_config_model_change_persists_session_metadata_immediately() {
+        let directory = tempdir().unwrap();
+        let manager = SessionManager::new(directory.path().to_path_buf(), 10);
+        let session = manager
+            .create("openai", "old-model", "/workspace", Some("model-switch"))
+            .unwrap();
+        let mut engine = make_engine("old-model");
+        engine.session_manager = Some(manager);
+        engine.current_session = Some(session);
+
+        engine.apply_config_update(Some("new-model".into()), None, None, None, None, None);
+
+        let manager = SessionManager::new(directory.path().to_path_buf(), 10);
+        assert_eq!(manager.load("model-switch").unwrap().model, "new-model");
     }
 
     #[test]
@@ -451,6 +559,7 @@ mod tests_phase6 {
             approval_manager: None,
             protocol_writer: None,
             compact_config: aion_config::compact::CompactConfig::default(),
+            compact_context_window_source: aion_config::config::CompactContextWindowSource::Default,
             compact_state: super::CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
@@ -739,6 +848,7 @@ mod tests_compact {
             approval_manager: None,
             protocol_writer: None,
             compact_config,
+            compact_context_window_source: aion_config::config::CompactContextWindowSource::Default,
             compact_state,
             context_state: Default::default(),
             prompt_usage: Default::default(),
@@ -1172,6 +1282,36 @@ mod tests_compact {
     // -- Microcompact runs when count trigger fires --
 
     #[tokio::test]
+    async fn microcompact_is_disabled_by_default() {
+        let mut messages = Vec::new();
+        for i in 0..12 {
+            let id = format!("t{i}");
+            messages.push(tool_use_msg(&id, "Read"));
+            messages.push(tool_result_msg(&id, &format!("data-{i}")));
+        }
+
+        let config = CompactConfig {
+            micro_keep_recent: 3,
+            ..Default::default()
+        };
+        let state = CompactState::new();
+        let mut engine = make_compact_engine(config, state, messages);
+
+        engine.run_compaction().await.unwrap();
+
+        let cleared_count = engine
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(
+                |block| matches!(block, ContentBlock::ToolResult { content, .. } if content == "[Tool result cleared]"),
+            )
+            .count();
+        assert_eq!(cleared_count, 0);
+        assert_eq!(engine.context_state.microcompact_count, 0);
+    }
+
+    #[tokio::test]
     async fn microcompact_clears_old_results() {
         // 12 tool results with keep_recent=3 (threshold=6) → should clear 9
         let mut messages = Vec::new();
@@ -1182,6 +1322,7 @@ mod tests_compact {
         }
 
         let config = CompactConfig {
+            microcompact_enabled: true,
             micro_keep_recent: 3,
             ..Default::default()
         };
@@ -1220,6 +1361,7 @@ mod tests_compact {
             context_window: 200_000,
             emergency_buffer: 3_000,
             max_failures: 3,
+            microcompact_enabled: true,
             micro_keep_recent: 1,
             ..Default::default()
         };
@@ -1304,6 +1446,7 @@ mod tests_compact {
 
         let config = CompactConfig {
             enabled: false,
+            microcompact_enabled: true,
             micro_keep_recent: 3,
             ..Default::default()
         };
@@ -1496,6 +1639,7 @@ mod tests_plan_mode {
             approval_manager: None,
             protocol_writer: None,
             compact_config: aion_config::compact::CompactConfig::default(),
+            compact_context_window_source: aion_config::config::CompactContextWindowSource::Default,
             compact_state: CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
@@ -1719,6 +1863,7 @@ mod tests_handle_command {
             approval_manager: None,
             protocol_writer: None,
             compact_config: CompactConfig::default(),
+            compact_context_window_source: aion_config::config::CompactContextWindowSource::Default,
             compact_state: CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),
@@ -2891,6 +3036,7 @@ mod tests_tool_policy_enforcement {
             approval_manager: None,
             protocol_writer: None,
             compact_config: Default::default(),
+            compact_context_window_source: aion_config::config::CompactContextWindowSource::Default,
             compact_state: CompactState::new(),
             context_state: Default::default(),
             prompt_usage: Default::default(),

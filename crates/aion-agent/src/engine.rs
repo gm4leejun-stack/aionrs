@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cache_diagnostics::{CacheBreakDetector, CacheDiagnostic, CacheStats};
-use crate::commands::{CommandContext, CommandRegistry, CommandResult, SlashCommand, default_registry};
+use crate::commands::{CommandContext, CommandRegistry, CommandResult, CommandSpec, SlashCommand, default_registry};
 use crate::compact::auto::{CompactError, autocompact, should_autocompact};
 use crate::compact::emergency::is_at_emergency_limit;
 use crate::compact::estimate::{estimate_tokens_from_tool_image, estimate_tokens_from_tool_result};
@@ -16,7 +16,9 @@ use crate::context_usage::{
     estimate_tool_definitions_tokens,
 };
 use crate::error::AgentError;
-use crate::orchestration::{ExecutionControl, execute_tool_calls, execute_tool_calls_with_approval};
+use crate::orchestration::{
+    ExecutionControl, execute_tool_calls_with_approval_and_output_limit, execute_tool_calls_with_output_limit,
+};
 use crate::output::OutputSink;
 use crate::plan::prompt::plan_mode_instructions;
 use crate::plan::state::PlanState;
@@ -32,7 +34,7 @@ use crate::turn::{FinalizationReason, ToolLoopWarning, TurnGuardAction, TurnGuar
 use aion_compact::CompactLevel;
 use aion_config::compact::CompactConfig;
 use aion_config::compat::ProviderCompat;
-use aion_config::config::Config;
+use aion_config::config::{CompactContextWindowSource, Config};
 use aion_config::hooks::HookEngine;
 use aion_protocol::ToolApprovalManager;
 use aion_protocol::events::ToolCategory;
@@ -152,6 +154,9 @@ pub struct AgentEngine {
     // Compaction and plan-mode state.
     /// Static compaction thresholds, flags, and sizing configuration.
     compact_config: CompactConfig,
+    /// Whether the compact context window follows the active model or is a
+    /// user override that runtime model switches must preserve.
+    compact_context_window_source: CompactContextWindowSource,
     /// Runtime context-size and compaction circuit-breaker state.
     compact_state: CompactState,
     /// Persisted usage, source, and successful compaction counters.
@@ -214,6 +219,7 @@ impl AgentEngine {
 
         let allow_list = config.tools.allow_list.clone();
         let compact_config = config.compact.clone();
+        let compact_context_window_source = config.compact_context_window_source;
 
         let prompt_usage = PromptUsage::from_system_prompt(&system_prompt);
         let mut engine = Self {
@@ -248,6 +254,7 @@ impl AgentEngine {
             approval_manager: None,
             protocol_writer: None,
             compact_config,
+            compact_context_window_source,
             compact_state: CompactState::new(),
             context_state: ContextState::default(),
             prompt_usage,
@@ -309,6 +316,7 @@ impl AgentEngine {
 
         let allow_list = config.tools.allow_list.clone();
         let compact_config = config.compact.clone();
+        let compact_context_window_source = config.compact_context_window_source;
 
         let prompt_usage = PromptUsage::from_system_prompt(&system_prompt);
         let context_state = session.context_state.clone();
@@ -346,6 +354,7 @@ impl AgentEngine {
             approval_manager: None,
             protocol_writer: None,
             compact_config,
+            compact_context_window_source,
             compact_state,
             context_state,
             prompt_usage,
@@ -415,6 +424,11 @@ impl AgentEngine {
             microcompact_count: self.context_state.microcompact_count,
             updated_at: self.context_state.updated_at,
         }
+    }
+
+    /// Return the model-visible skills loaded for this engine runtime.
+    pub fn skill_names(&self) -> &[String] {
+        &self.prompt_usage.skills
     }
 
     /// Get a reference to the output sink
@@ -857,13 +871,13 @@ impl AgentEngine {
         let (executable_results, executable_modifiers, follow_up_blocks) = if executable_tool_calls.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
         } else if let Some(ref approval_mgr) = self.approval_manager {
-            // JSON stream mode: use protocol-based approval
+            // Interactive hosts use protocol-based approval.
             let writer = self
                 .protocol_writer
                 .as_ref()
                 .expect("protocol writer required for approval");
             let auto_approve = self.confirmer.lock().unwrap().is_auto_approve();
-            match execute_tool_calls_with_approval(
+            match execute_tool_calls_with_approval_and_output_limit(
                 &self.tools,
                 &executable_tool_calls,
                 approval_mgr,
@@ -874,6 +888,7 @@ impl AgentEngine {
                 self.hooks.as_mut(),
                 self.compact_level,
                 self.toon_enabled,
+                self.compact_config.tool_output_max_bytes,
             )
             .await
             {
@@ -885,13 +900,14 @@ impl AgentEngine {
             }
         } else {
             // Terminal mode: use interactive confirmation
-            match execute_tool_calls(
+            match execute_tool_calls_with_output_limit(
                 &self.tools,
                 &executable_tool_calls,
                 &self.confirmer,
                 self.hooks.as_mut(),
                 self.compact_level,
                 self.toon_enabled,
+                self.compact_config.tool_output_max_bytes,
             )
             .await
             {
@@ -1286,14 +1302,14 @@ impl AgentEngine {
         }
     }
 
-    /// Run the multi-level compaction pipeline before each API call.
+    /// Run context compaction guards before each API call.
     ///
-    /// Execution order: microcompact → autocompact → emergency check.
+    /// Execution order: optional legacy microcompact → autocompact → emergency check.
     /// After a successful autocompact the emergency check is skipped
     /// because the context has been significantly reduced.
     async fn run_compaction(&mut self) -> Result<(), AgentError> {
         // 1. Microcompact (lightweight, no LLM call)
-        if should_microcompact(&self.messages, &self.compact_config) {
+        if self.compact_config.microcompact_enabled && should_microcompact(&self.messages, &self.compact_config) {
             let result = microcompact(&mut self.messages, &self.compact_config);
             if result.cleared_count > 0 {
                 self.output.emit_info(&format!(
@@ -1471,6 +1487,40 @@ impl AgentEngine {
     /// Default thinking budget when "enabled" is requested without a specific budget.
     const DEFAULT_THINKING_BUDGET: u32 = 10_000;
 
+    fn recompute_compact_context_window_for_model(&mut self, changes: &mut Vec<String>) {
+        if self.compact_context_window_source == CompactContextWindowSource::Explicit {
+            return;
+        }
+
+        let old_window = self.compact_config.context_window;
+        let (new_window, new_source) = self
+            .compat
+            .context_window_for_model(&self.model)
+            .map(|window| (window, CompactContextWindowSource::ModelCatalog))
+            .unwrap_or_else(|| {
+                (
+                    CompactConfig::default().context_window,
+                    CompactContextWindowSource::Default,
+                )
+            });
+
+        self.compact_config.context_window = new_window;
+        self.compact_context_window_source = new_source;
+
+        debug!(
+            target: "aion_agent",
+            model = %self.model,
+            old_context_window = old_window,
+            context_window = new_window,
+            source = ?new_source,
+            "compact context window recomputed after runtime model change"
+        );
+
+        if old_window != new_window {
+            changes.push(format!("context window: {old_window} → {new_window}"));
+        }
+    }
+
     /// Apply a runtime config update received from the protocol layer.
     ///
     /// Returns a list of human-readable change descriptions for the Info event.
@@ -1489,7 +1539,14 @@ impl AgentEngine {
 
         if let Some(new_model) = model {
             let old = replace(&mut self.model, new_model.clone());
+            if let Some(session) = &mut self.current_session {
+                session.model = new_model.clone();
+            }
             changes.push(format!("model: {old} → {new_model}"));
+        }
+
+        if model_changed {
+            self.recompute_compact_context_window_for_model(&mut changes);
         }
 
         if let Some(new_capability) = image_input {
@@ -1561,6 +1618,10 @@ impl AgentEngine {
                     changes.push(format!("compaction: invalid ({e})"));
                 }
             }
+        }
+
+        if model_changed {
+            self.save_session();
         }
 
         changes
@@ -1648,6 +1709,11 @@ impl AgentEngine {
             .iter()
             .map(|cmd| (cmd.name().to_string(), cmd.description().to_string()))
             .collect()
+    }
+
+    /// Return user-facing metadata for interactive slash-command discovery.
+    pub fn slash_commands(&self) -> Vec<CommandSpec> {
+        self.commands.specs()
     }
 
     /// Apply context modifiers collected from skill tool executions.
