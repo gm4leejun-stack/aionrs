@@ -7,6 +7,44 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn dropped_receiver_cancels_empty_stream_retry() {
+        tokio::time::pause();
+        let count = Arc::new(AtomicU32::new(0));
+        let processed = Arc::new(tokio::sync::Notify::new());
+        let rx = run_stream(
+            {
+                let count = count.clone();
+                move || {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, ProviderError>(())
+                    }
+                }
+            },
+            {
+                let processed = processed.clone();
+                move |_, _| {
+                    let processed = processed.clone();
+                    async move {
+                        processed.notify_one();
+                        StreamOutcome::FailedEmpty(ProviderError::Connection("disconnect".into()))
+                    }
+                }
+            },
+            RetryPolicy::new(2, false, true, false),
+        )
+        .await
+        .unwrap();
+        processed.notified().await;
+        drop(rx);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "cancelled request must not resend");
+    }
+
     async fn reqwest_builder_error() -> reqwest::Error {
         reqwest::Client::new()
             .get("http://")
