@@ -173,14 +173,34 @@ pub(crate) fn merge_tool_results(
     executable_results: Vec<ContentBlock>,
     executable_modifiers: Vec<Option<ContextModifier>>,
 ) -> (Vec<ContentBlock>, Vec<Option<ContextModifier>>) {
+    let capability_errors = vec![None; tool_calls.len()];
+    merge_tool_results_with_capability_errors(
+        tool_calls,
+        tool_call_malformed_reasons,
+        &capability_errors,
+        policy_denied_tool_names,
+        executable_results,
+        executable_modifiers,
+    )
+}
+
+pub(crate) fn merge_tool_results_with_capability_errors(
+    tool_calls: &[ContentBlock],
+    tool_call_malformed_reasons: &[Option<ToolCallMalformedReason>],
+    capability_errors: &[Option<String>],
+    policy_denied_tool_names: &[Option<String>],
+    executable_results: Vec<ContentBlock>,
+    executable_modifiers: Vec<Option<ContextModifier>>,
+) -> (Vec<ContentBlock>, Vec<Option<ContextModifier>>) {
     let mut executable_results = executable_results.into_iter();
     let mut executable_modifiers = executable_modifiers.into_iter();
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut tool_modifiers = Vec::with_capacity(tool_calls.len());
 
-    for ((call, reason), denied_name) in tool_calls
+    for (((call, reason), capability_error), denied_name) in tool_calls
         .iter()
         .zip(tool_call_malformed_reasons)
+        .zip(capability_errors)
         .zip(policy_denied_tool_names)
     {
         if let Some(reason) = reason {
@@ -202,6 +222,16 @@ pub(crate) fn merge_tool_results(
                     reason.description(),
                     reason.reissue_field()
                 ),
+                is_error: true,
+            });
+            tool_modifiers.push(None);
+        } else if let Some(capability_error) = capability_error {
+            let ContentBlock::ToolUse { id, .. } = call else {
+                continue;
+            };
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: capability_error.clone(),
                 is_error: true,
             });
             tool_modifiers.push(None);
@@ -246,6 +276,31 @@ pub(crate) struct ToolCallFailureTracker {
     last: Option<ToolCallFailureFingerprint>,
     count: usize,
     limit: usize,
+}
+
+/// Repair only the unambiguous case where a model sends an ExecCommand-shaped
+/// payload to Edit. Any edit fields make the input ambiguous and are left
+/// untouched so the normal Edit contract error remains visible.
+pub(crate) fn repair_tool_call(call: ContentBlock) -> Option<ContentBlock> {
+    let ContentBlock::ToolUse { id, name, input, extra } = call else {
+        return None;
+    };
+
+    if name != "Edit"
+        || input.get("cmd").and_then(|value| value.as_str()).is_none()
+        || ["file_path", "old_string", "new_string", "replace_all"]
+            .iter()
+            .any(|key| input.get(*key).is_some())
+    {
+        return None;
+    }
+
+    Some(ContentBlock::ToolUse {
+        id,
+        name: "ExecCommand".to_string(),
+        input,
+        extra,
+    })
 }
 
 impl ToolCallFailureTracker {

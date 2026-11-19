@@ -68,7 +68,9 @@ fn count_trigger(messages: &[Message], config: &CompactConfig) -> bool {
 /// Clear old tool result content in-place.
 ///
 /// Keeps the `config.micro_keep_recent` most recent compactable results
-/// (minimum 1) and replaces older ones with [`CLEARED_TOOL_RESULT`].
+/// (minimum 1) and all results after the latest assistant message, since
+/// the model has not consumed that tool round yet. Replaces older ones
+/// with [`CLEARED_TOOL_RESULT`].
 /// Already-cleared results are left untouched and do not count toward
 /// the keep budget.
 pub fn microcompact(messages: &mut [Message], config: &CompactConfig) -> MicrocompactResult {
@@ -88,11 +90,15 @@ pub fn microcompact(messages: &mut [Message], config: &CompactConfig) -> Microco
     }
 
     let to_clear = &targets[..targets.len() - keep];
+    let latest_assistant = messages.iter().rposition(|message| message.role == Role::Assistant);
 
     let mut cleared_count = 0usize;
     let mut tokens_freed = 0usize;
 
     for &(mi, bi) in to_clear {
+        if latest_assistant.is_some_and(|index| mi > index) {
+            continue;
+        }
         if let ContentBlock::ToolResult { content, .. } = &mut messages[mi].content[bi] {
             // Rough token estimate: ~4 chars per token.
             tokens_freed += content.len() / 4;

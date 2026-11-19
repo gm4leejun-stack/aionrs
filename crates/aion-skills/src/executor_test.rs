@@ -37,6 +37,16 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_inline_content_without_timeout_allows_long_shell_step() {
+        let skill = make_skill("before ```!\nsleep 0.2; printf managed_skill_done\n``` after", None);
+        let result = prepare_inline_content_without_timeout(&skill, None, None, Path::new("/tmp"))
+            .await
+            .expect("managed skill shell should complete");
+        assert!(result.contains("managed_skill_done"), "got: {result}");
+    }
+
     #[tokio::test]
     async fn test_prepare_inline_no_args() {
         let skill = make_skill("Do the thing.", None);

@@ -1,8 +1,11 @@
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::task::{spawn_blocking, yield_now};
+use tokio::time::timeout;
 
 use aion_protocol::events::ToolCategory;
 use aion_types::file_state::FileState;
@@ -10,23 +13,95 @@ use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
 use crate::file_cache::{FileStateCache, file_mtime_ms};
-
-/// Stub returned when a file has not changed since the model last read it.
-/// Saves tokens by avoiding re-sending identical content.
-const FILE_UNCHANGED_STUB: &str = "File unchanged since last read. The content from the earlier Read \
-     tool_result in this conversation is still current — refer to that \
-     instead of re-reading.";
+use crate::workspace_path::is_within_workspace;
 
 pub struct ReadTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl ReadTool {
-    /// Create a ReadTool with optional file state cache for dedup.
+    /// Create a ReadTool with an optional file state cache.
     ///
     /// Pass `None` to disable caching (all reads return full content).
     pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>) -> Self {
-        Self { file_cache }
+        Self {
+            file_cache,
+            workspace: None,
+        }
+    }
+
+    pub fn new_in_workspace(file_cache: Option<Arc<RwLock<FileStateCache>>>, workspace: std::path::PathBuf) -> Self {
+        Self {
+            file_cache,
+            workspace: Some(workspace),
+        }
+    }
+
+    fn allowed_path(&self, file_path: &str) -> bool {
+        let Some(workspace) = &self.workspace else {
+            return true;
+        };
+        is_within_workspace(workspace, Path::new(file_path))
+    }
+
+    fn read_file(&self, file_path: &str, offset: Option<usize>, limit: Option<usize>) -> ToolResult {
+        let mtime_ms = file_mtime_ms(Path::new(file_path));
+        if let (Some(cache_arc), Some(current_mtime)) = (&self.file_cache, mtime_ms)
+            && let Ok(mut cache) = cache_arc.write()
+            && let Some(cached) = cache.get(Path::new(file_path))
+            && cached.offset == offset
+            && cached.limit == limit
+            && cached.mtime_ms == current_mtime
+        {
+            return ToolResult {
+                content: cached.content.clone(),
+                is_error: false,
+            };
+        }
+        let content = match std::fs::read(file_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return ToolResult {
+                    content: format!("Failed to read file {file_path}: {error}"),
+                    is_error: true,
+                };
+            }
+        };
+        if content.iter().take(8192).any(|&byte| byte == 0) {
+            return ToolResult {
+                content: format!("(binary file, {} bytes)", content.len()),
+                is_error: false,
+            };
+        }
+        let text = String::from_utf8_lossy(&content);
+        let lines: Vec<&str> = text.lines().collect();
+        let effective_offset = offset.unwrap_or(0);
+        let effective_limit = limit.unwrap_or(lines.len());
+        let end = effective_offset.saturating_add(effective_limit).min(lines.len());
+        let numbered: Vec<String> = lines[effective_offset.min(lines.len())..end]
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("{:>6}\t{}", effective_offset + index + 1, line))
+            .collect();
+        let result_content = numbered.join("\n");
+        if let Some(cache_arc) = &self.file_cache
+            && let (Ok(mut cache), Some(mtime)) = (cache_arc.write(), mtime_ms)
+        {
+            cache.insert(
+                file_path.into(),
+                FileState {
+                    content: result_content.clone(),
+                    mtime_ms: mtime,
+                    offset,
+                    limit,
+                },
+            );
+        }
+        ToolResult {
+            content: result_content,
+            is_error: false,
+        }
     }
 }
 
@@ -78,82 +153,40 @@ impl Tool for ReadTool {
                 is_error: true,
             };
         };
+        if !self.allowed_path(file_path) {
+            return ToolResult {
+                content: format!("Path is outside the workspace and is not allowed: {file_path}"),
+                is_error: true,
+            };
+        }
 
         let offset = input["offset"].as_u64().map(|v| v as usize);
         let limit = input["limit"].as_u64().map(|v| v as usize);
 
-        // Get file mtime for dedup and cache.
-        let mtime_ms = file_mtime_ms(Path::new(file_path));
-
-        // Dedup check: if cache has the same file with matching offset/limit and mtime,
-        // return a short stub instead of full content.
-        if let (Some(cache_arc), Some(current_mtime)) = (&self.file_cache, mtime_ms)
-            && let Ok(mut cache) = cache_arc.write()
-            && let Some(cached) = cache.get(Path::new(file_path))
-            && cached.offset == offset
-            && cached.limit == limit
-            && cached.mtime_ms == current_mtime
-        {
-            return ToolResult {
-                content: FILE_UNCHANGED_STUB.to_string(),
-                is_error: false,
-            };
-        }
-
-        // Read file from disk.
-        let content = match std::fs::read(file_path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return ToolResult {
-                    content: format!("Failed to read file {}: {}", file_path, e),
-                    is_error: true,
+        let file_path = file_path.to_owned();
+        let reader = Self::new(self.file_cache.clone());
+        // Disk and large text processing stay off the async executor. Dropping
+        // this future stops waiting, but cannot forcibly abort a disk syscall.
+        yield_now().await;
+        let worker = spawn_blocking(move || reader.read_file(&file_path, offset, limit));
+        match timeout(Duration::from_secs(30), worker).await {
+            Ok(Ok(result)) => result,
+            result => {
+                let message = if result.is_err() {
+                    "File read timed out; narrow the input or check the filesystem"
+                } else {
+                    "File read worker failed"
                 };
+                tracing::warn!(
+                    tool = "Read",
+                    failure_kind = if result.is_err() { "timeout" } else { "worker" },
+                    "File read did not complete"
+                );
+                ToolResult {
+                    content: message.to_owned(),
+                    is_error: true,
+                }
             }
-        };
-
-        // Check if binary.
-        if content.iter().take(8192).any(|&b| b == 0) {
-            return ToolResult {
-                content: format!("(binary file, {} bytes)", content.len()),
-                is_error: false,
-            };
-        }
-
-        let text = String::from_utf8_lossy(&content);
-        let lines: Vec<&str> = text.lines().collect();
-
-        let effective_offset = offset.unwrap_or(0);
-        let effective_limit = limit.unwrap_or(lines.len());
-
-        let end = (effective_offset + effective_limit).min(lines.len());
-        let slice = &lines[effective_offset.min(lines.len())..end];
-
-        let numbered: Vec<String> = slice
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:>6}\t{}", effective_offset + i + 1, line))
-            .collect();
-
-        let result_content = numbered.join("\n");
-
-        // Update cache after successful read.
-        if let Some(cache_arc) = &self.file_cache
-            && let (Ok(mut cache), Some(mtime)) = (cache_arc.write(), mtime_ms)
-        {
-            cache.insert(
-                file_path.into(),
-                FileState {
-                    content: result_content.clone(),
-                    mtime_ms: mtime,
-                    offset,
-                    limit,
-                },
-            );
-        }
-
-        ToolResult {
-            content: result_content,
-            is_error: false,
         }
     }
 

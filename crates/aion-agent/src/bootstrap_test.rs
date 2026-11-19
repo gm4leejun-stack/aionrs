@@ -89,7 +89,7 @@ mod tests {
         write_skill(isolated_root.path(), "isolated-only");
 
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
-        let bootstrap = AgentBootstrap::new(test_config(), workspace.path().to_string_lossy(), output)
+        let mut bootstrap = AgentBootstrap::new(test_config(), workspace.path().to_string_lossy(), output)
             .isolated_skill_dirs(vec![isolated_root.path().to_path_buf()]);
 
         let names = bootstrap
@@ -101,6 +101,29 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "isolated-only"));
         assert!(!names.iter().any(|name| name == "workspace-only"));
+    }
+
+    #[test]
+    fn managed_execution_is_opt_in_and_reaches_registered_exec_command() {
+        let output: Arc<dyn OutputSink> = Arc::new(NullSink);
+        let legacy = AgentBootstrap::new(test_config(), "/tmp", output.clone());
+        let managed = AgentBootstrap::new(test_config(), "/tmp", output).managed_execution(true);
+        assert!(
+            legacy
+                .build_builtin_registry(Path::new("/tmp"))
+                .get("ExecCommand")
+                .unwrap()
+                .description()
+                .contains("default 120000")
+        );
+        assert!(
+            managed
+                .build_builtin_registry(Path::new("/tmp"))
+                .get("ExecCommand")
+                .unwrap()
+                .description()
+                .contains("no default wall-clock deadline")
+        );
     }
 
     #[test]

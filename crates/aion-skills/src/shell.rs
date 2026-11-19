@@ -24,6 +24,25 @@ pub async fn execute_shell_commands(
     loaded_from: LoadedFrom,
     cwd: &Path,
 ) -> Result<String, ShellExecutionError> {
+    execute_shell_commands_policy(content, loaded_from, cwd, false).await
+}
+
+/// Expand embedded shell commands without a default wall-clock deadline.
+/// Process containment and cancellation-on-drop still apply.
+pub async fn execute_shell_commands_without_timeout(
+    content: &str,
+    loaded_from: LoadedFrom,
+    cwd: &Path,
+) -> Result<String, ShellExecutionError> {
+    execute_shell_commands_policy(content, loaded_from, cwd, true).await
+}
+
+async fn execute_shell_commands_policy(
+    content: &str,
+    loaded_from: LoadedFrom,
+    cwd: &Path,
+    managed: bool,
+) -> Result<String, ShellExecutionError> {
     if loaded_from == LoadedFrom::Mcp {
         return Ok(content.to_owned());
     }
@@ -34,7 +53,10 @@ pub async fn execute_shell_commands(
     }
 
     // Execute all commands in parallel
-    let futures: Vec<_> = matches.iter().map(|m| execute_command(&m.command, cwd)).collect();
+    let futures: Vec<_> = matches
+        .iter()
+        .map(|m| execute_command(&m.command, cwd, managed))
+        .collect();
     let outputs: Vec<Result<String, ShellExecutionError>> = join_all(futures).await;
 
     // Pair matches with outputs; fail-fast on first error
@@ -187,18 +209,20 @@ fn extract_shell_matches(content: &str) -> Vec<ShellMatch> {
 // ---------------------------------------------------------------------------
 
 /// Execute a single shell command and return its combined stdout/stderr output.
-async fn execute_command(command: &str, cwd: &Path) -> Result<String, ShellExecutionError> {
+async fn execute_command(command: &str, cwd: &Path, managed: bool) -> Result<String, ShellExecutionError> {
     let shell = aion_config::shell::default_shell();
     let mut command_builder = aion_config::shell::shell_command_builder(&shell, command, false);
     command_builder.current_dir(cwd);
 
-    let result = CommandRunner::new(command_builder)
-        .run()
-        .await
-        .map_err(|e| ShellExecutionError::CommandFailed {
-            pattern: command.to_owned(),
-            output: e.to_string(),
-        })?;
+    let runner = CommandRunner::new(command_builder);
+    let runner = match shell_timeout(managed) {
+        Some(duration) => runner.timeout(duration),
+        None => runner.without_timeout(),
+    };
+    let result = runner.run().await.map_err(|e| ShellExecutionError::CommandFailed {
+        pattern: command.to_owned(),
+        output: e.to_string(),
+    })?;
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -224,6 +248,10 @@ async fn execute_command(command: &str, cwd: &Path) -> Result<String, ShellExecu
     }
 
     Ok(formatted)
+}
+
+fn shell_timeout(managed: bool) -> Option<std::time::Duration> {
+    (!managed).then_some(DEFAULT_TIMEOUT)
 }
 
 /// Format stdout and stderr into a single string.

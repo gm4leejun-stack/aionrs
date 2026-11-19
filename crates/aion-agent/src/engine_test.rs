@@ -53,6 +53,7 @@ mod tests_set_config {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            image_capability_resolver: None,
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -536,6 +537,7 @@ mod tests_phase6 {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            image_capability_resolver: None,
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -824,6 +826,7 @@ mod tests_compact {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            image_capability_resolver: None,
             system_prompt: String::new(),
             reasoning_effort: None,
             messages,
@@ -1614,6 +1617,7 @@ mod tests_plan_mode {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            image_capability_resolver: None,
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -1837,6 +1841,7 @@ mod tests_handle_command {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            image_capability_resolver: None,
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -2179,7 +2184,7 @@ mod tests_handle_command {
 
         assert_eq!(failed_executions.load(Ordering::SeqCst), 3);
         assert_eq!(successful_executions.load(Ordering::SeqCst), 3);
-        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.stop_reason, StopReason::MaxTurns);
         assert_eq!(result.turns, 3);
         assert!(result.text.contains("tool is blocked"));
 
@@ -2479,7 +2484,7 @@ mod tests_loop_helpers {
         let mut guards = TurnGuards::new(Some(100), 3, DEFAULT_MAX_TOOL_CALL_FAILURE);
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
@@ -2492,11 +2497,21 @@ mod tests_loop_helpers {
     }
 
     #[test]
+    fn after_tool_round_warns_on_first_tool_failure() {
+        let mut guards = TurnGuards::new(Some(100), 3, DEFAULT_MAX_TOOL_CALL_FAILURE);
+
+        assert!(matches!(
+            guards.after_tool_round(None, failed_exec_fingerprint(), true),
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+        ));
+    }
+
+    #[test]
     fn after_tool_round_resets_tool_call_failure_streak_on_success() {
         let mut guards = TurnGuards::new(Some(100), 3, DEFAULT_MAX_TOOL_CALL_FAILURE);
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
         // A non-error tool round resets the streak.
         assert!(matches!(
@@ -2508,7 +2523,7 @@ mod tests_loop_helpers {
         // So a single subsequent tool-call-failure round must not trip the breaker.
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), true),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
     }
 
@@ -2518,7 +2533,7 @@ mod tests_loop_helpers {
 
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), false),
-            TurnGuardAction::Continue
+            TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
         ));
         assert!(matches!(
             guards.after_tool_round(None, failed_exec_fingerprint(), false),
@@ -2543,7 +2558,7 @@ mod tests_loop_helpers {
 
             assert!(matches!(
                 guards.after_tool_round(None, fingerprint, true),
-                TurnGuardAction::Continue
+                TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
             ));
             assert_eq!(guards.tool_call_failure_count(), 1);
         }
@@ -2562,6 +2577,14 @@ mod tests_loop_helpers {
             let action = guards.after_tool_round(None, fingerprint, true);
 
             match index {
+                1 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
+                2 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
                 3 => assert!(matches!(
                     action,
                     TurnGuardAction::Warn(ToolLoopWarning::AllErrorRounds { count: 3, limit: 8 })
@@ -2589,6 +2612,14 @@ mod tests_loop_helpers {
             let action = guards.after_tool_round(None, fingerprint, true);
 
             match index {
+                0 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
+                1 => assert!(matches!(
+                    action,
+                    TurnGuardAction::Warn(ToolLoopWarning::ExactFailure { count: 1, limit: 3 })
+                )),
                 2 => assert!(matches!(
                     action,
                     TurnGuardAction::Warn(ToolLoopWarning::AllErrorRounds { .. })
@@ -2778,6 +2809,7 @@ mod tests_tool_policy_enforcement {
     use super::{AgentEngine, CacheBreakDetector, CompactLevel, CompactState, ProviderCompat};
     use crate::commands::default_registry;
     use crate::confirm::ToolConfirmer;
+    use crate::engine::ImageCapabilityResolver;
     use crate::output::OutputSink;
     use crate::tool_policy::ToolPolicy;
     use crate::turn::TurnKind;
@@ -2809,6 +2841,123 @@ mod tests_tool_policy_enforcement {
         name: &'static str,
         executions: Arc<AtomicUsize>,
         requires_image_input: bool,
+    }
+
+    struct StaticImageCapabilityResolver {
+        capability: ImageInputCapability,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct SnapshotResolver {
+        state: Arc<Mutex<(ImageInputCapability, bool)>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ImageCapabilityResolver for SnapshotResolver {
+        fn snapshot(&self, _: &str) -> Option<(ImageInputCapability, bool)> {
+            Some(*self.state.lock().unwrap())
+        }
+
+        async fn resolve(&self, _: &str) -> ImageInputCapability {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            *state = (ImageInputCapability::Unknown, false);
+            state.0
+        }
+    }
+
+    #[tokio::test]
+    async fn image_probe_cooldown_hides_tool_and_expiry_reopens_without_network() {
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(CountingTool {
+            name: "ViewImage",
+            executions: Arc::new(AtomicUsize::new(0)),
+            requires_image_input: true,
+        }));
+        engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
+        let state = Arc::new(Mutex::new((ImageInputCapability::Unknown, true)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_image_capability_resolver(SnapshotResolver {
+            state: state.clone(),
+            calls: calls.clone(),
+        });
+        assert!(
+            engine
+                .build_request(TurnKind::Normal)
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ViewImage")
+        );
+        engine
+            .execute_tool_round(&[tool_use("image", "ViewImage")])
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .build_request(TurnKind::Normal)
+                .tools
+                .iter()
+                .all(|tool| tool.name != "ViewImage")
+        );
+        engine
+            .execute_tool_round(&[tool_use("image-again", "ViewImage")])
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        *state.lock().unwrap() = (ImageInputCapability::Unknown, true);
+        assert!(
+            engine
+                .build_request(TurnKind::Normal)
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ViewImage")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "advertising never probes");
+    }
+
+    #[tokio::test]
+    async fn invalid_native_image_parameters_do_not_trigger_probe() {
+        use aion_tools::view_image::ViewImageTool;
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(ViewImageTool::new()));
+        engine.tool_policy = ToolPolicy::allow_only(["ViewImage"]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_image_capability_resolver(StaticImageCapabilityResolver {
+            capability: ImageInputCapability::Supported,
+            calls: calls.clone(),
+        });
+        let output = engine
+            .execute_tool_round(&[tool_use("invalid-image", "ViewImage")])
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(output.follow_up_blocks.is_empty());
+        assert!(
+            matches!(&output.tool_results[0], ContentBlock::ToolResult { content, is_error: true, .. } if content.contains("file_path"))
+        );
+    }
+
+    #[test]
+    fn image_snapshot_expires_supported_and_does_not_inherit_previous_model() {
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.compat.image_input = Some(ImageInputCapability::Supported);
+        let state = Arc::new(Mutex::new((ImageInputCapability::Unknown, false)));
+        engine.set_image_capability_resolver(SnapshotResolver {
+            state,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        engine.build_request(TurnKind::Normal);
+        assert_eq!(engine.compat.image_input(), ImageInputCapability::Unknown);
+    }
+
+    #[async_trait]
+    impl ImageCapabilityResolver for StaticImageCapabilityResolver {
+        async fn resolve(&self, model: &str) -> ImageInputCapability {
+            assert_eq!(model, "test-model");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.capability
+        }
     }
 
     #[async_trait]
@@ -2862,6 +3011,7 @@ mod tests_tool_policy_enforcement {
         AgentEngine {
             provider: Arc::new(NullProvider),
             compat: ProviderCompat::anthropic_defaults(),
+            image_capability_resolver: None,
             thinking: None,
             system_prompt: String::new(),
             model: "test-model".to_string(),
@@ -2936,6 +3086,177 @@ mod tests_tool_policy_enforcement {
         engine.compat.image_input = Some(ImageInputCapability::Supported);
         let vision_request = engine.build_request(TurnKind::Normal);
         assert!(vision_request.tools.iter().any(|tool| tool.name == "ViewImage"));
+    }
+
+    #[test]
+    fn build_request_advertises_image_tool_when_unknown_resolver_is_installed() {
+        let image_executions = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(CountingTool {
+            name: "ViewImage",
+            executions: image_executions,
+            requires_image_input: true,
+        }));
+        engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
+        engine.set_image_capability_resolver(StaticImageCapabilityResolver {
+            capability: ImageInputCapability::Supported,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let request = engine.build_request(TurnKind::Normal);
+
+        assert!(request.tools.iter().any(|tool| tool.name == "ViewImage"));
+    }
+
+    #[test]
+    fn build_request_hides_image_tool_for_unknown_capability_without_resolver() {
+        let image_executions = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(CountingTool {
+            name: "ViewImage",
+            executions: image_executions,
+            requires_image_input: true,
+        }));
+        engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
+
+        let request = engine.build_request(TurnKind::Normal);
+
+        assert!(request.tools.iter().all(|tool| tool.name != "ViewImage"));
+    }
+
+    #[tokio::test]
+    async fn image_capability_resolver_supported_runs_image_tool_once() {
+        let image_executions = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(CountingTool {
+            name: "ViewImage",
+            executions: Arc::clone(&image_executions),
+            requires_image_input: true,
+        }));
+        engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
+        engine.set_image_capability_resolver(StaticImageCapabilityResolver {
+            capability: ImageInputCapability::Supported,
+            calls: Arc::clone(&resolver_calls),
+        });
+
+        let output = engine
+            .execute_tool_round(&[tool_use("image-1", "ViewImage")])
+            .await
+            .unwrap();
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(image_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.compat.image_input(), ImageInputCapability::Supported);
+        assert!(matches!(
+            output.tool_results.as_slice(),
+            [ContentBlock::ToolResult { is_error: false, .. }]
+        ));
+        assert!(output.follow_up_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_capability_resolver_unsupported_synthesizes_error_without_execution() {
+        let image_executions = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(CountingTool {
+            name: "ViewImage",
+            executions: Arc::clone(&image_executions),
+            requires_image_input: true,
+        }));
+        engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
+        engine.set_image_capability_resolver(StaticImageCapabilityResolver {
+            capability: ImageInputCapability::Unsupported,
+            calls: Arc::clone(&resolver_calls),
+        });
+
+        let output = engine
+            .execute_tool_round(&[tool_use("image-1", "ViewImage")])
+            .await
+            .unwrap();
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(image_executions.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.compat.image_input(), ImageInputCapability::Unsupported);
+        assert!(matches!(
+            output.tool_results.as_slice(),
+            [ContentBlock::ToolResult { is_error: true, .. }]
+        ));
+        assert!(output.follow_up_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_capability_resolver_unknown_synthesizes_error_without_execution() {
+        let image_executions = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(CountingTool {
+            name: "ViewImage",
+            executions: Arc::clone(&image_executions),
+            requires_image_input: true,
+        }));
+        engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
+        engine.set_image_capability_resolver(StaticImageCapabilityResolver {
+            capability: ImageInputCapability::Unknown,
+            calls: Arc::clone(&resolver_calls),
+        });
+
+        let output = engine
+            .execute_tool_round(&[tool_use("image-1", "ViewImage")])
+            .await
+            .unwrap();
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(image_executions.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.compat.image_input(), ImageInputCapability::Unknown);
+        assert!(matches!(
+            output.tool_results.as_slice(),
+            [ContentBlock::ToolResult { is_error: true, .. }]
+        ));
+        assert!(output.follow_up_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_capability_without_resolver_keeps_generic_denial() {
+        let image_executions = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.tools.register(Box::new(CountingTool {
+            name: "ViewImage",
+            executions: Arc::clone(&image_executions),
+            requires_image_input: true,
+        }));
+        engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
+
+        let output = engine
+            .execute_tool_round(&[tool_use("image-1", "ViewImage")])
+            .await
+            .unwrap();
+
+        assert_eq!(image_executions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            output.tool_results.as_slice(),
+            [ContentBlock::ToolResult { is_error: true, content, .. }] if content.contains("not available")
+        ));
+        assert!(output.follow_up_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_capability_resolver_is_not_called_without_image_tool_calls() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        engine.set_image_capability_resolver(StaticImageCapabilityResolver {
+            capability: ImageInputCapability::Supported,
+            calls: Arc::clone(&resolver_calls),
+        });
+
+        let output = engine.execute_tool_round(&[tool_use("read-1", "Read")]).await.unwrap();
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            output.tool_results.as_slice(),
+            [ContentBlock::ToolResult { is_error: false, .. }]
+        ));
     }
 
     #[tokio::test]

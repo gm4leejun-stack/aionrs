@@ -25,6 +25,60 @@ fn silent_output() -> Arc<dyn OutputSink> {
     Arc::new(TerminalSink::new(true))
 }
 
+#[tokio::test]
+async fn compaction_does_not_hide_unseen_results_from_a_large_tool_round() {
+    use aion_agent::bootstrap::AgentBootstrap;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("sales.csv");
+    std::fs::write(&input, "month,revenue\n2026-01,3600\n").unwrap();
+    let mut first_round: Vec<_> = (0..12)
+        .map(|i| LlmEvent::ToolUse {
+            id: format!("read-{i}"),
+            name: "Read".into(),
+            input: json!({"file_path": input}),
+            extra: None,
+        })
+        .collect();
+    first_round.push(LlmEvent::Done {
+        stop_reason: StopReason::ToolUse,
+        usage: TokenUsage::default(),
+    });
+    let provider = Arc::new(RecordingRequestProvider::new(vec![
+        first_round,
+        vec![
+            LlmEvent::TextDelta("done".into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ],
+    ]));
+    let requests = provider.requests();
+    let mut config = test_config();
+    config.tools.auto_approve = true;
+    config.compact.micro_keep_recent = 2;
+    let mut result = AgentBootstrap::new(config, dir.path().to_string_lossy(), silent_output())
+        .provider(provider)
+        .build()
+        .await
+        .unwrap();
+
+    result.engine.run("read all data", "test").await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    let results: Vec<_> = requests[1]
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 12);
+    assert!(results.iter().all(|content| content.contains("2026-01,3600")));
+}
+
 fn tool_call_malformed_turn(id: &str, name: &str, input: Value) -> Vec<LlmEvent> {
     vec![
         LlmEvent::ToolUse {
@@ -583,14 +637,11 @@ async fn empty_final_falls_back_after_one_empty_retry() {
     engine
         .init_session("test-provider", "/tmp", None)
         .expect("init_session should succeed");
-    let result = engine
+    let error = engine
         .run("Answer visibly", "")
         .await
-        .expect("engine should fall back successfully");
-
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
-    assert_eq!(result.turns, 2);
-    assert!(result.text.contains("finished without visible answer text"));
+        .expect_err("an empty fallback must not report success");
+    assert!(error.to_string().contains("finished without visible answer text"));
 
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded.len(), 3);
@@ -616,7 +667,7 @@ async fn empty_final_falls_back_after_one_empty_retry() {
     assert!(
         matches!(
             &last_message.content[..],
-            [ContentBlock::Text { text }] if text == &result.text
+            [ContentBlock::Text { text }] if text.contains("finished without visible answer text")
         ),
         "fallback assistant message should be text-only"
     );
@@ -694,17 +745,11 @@ async fn max_tokens_finalization_tool_call_falls_back_without_persisting_tool_us
         .init_session("test-provider", "/tmp", None)
         .expect("init_session should succeed");
 
-    let result = engine
+    let error = engine
         .run("Give me a long answer", "")
         .await
-        .expect("engine should fall back successfully");
-
-    assert_eq!(result.stop_reason, StopReason::MaxTokens);
-    assert_eq!(result.turns, 1);
-    assert!(
-        !result.text.trim().is_empty(),
-        "fallback result text should be non-empty"
-    );
+        .expect_err("an invalid finalization must not report success");
+    assert!(error.to_string().contains("token limit"));
 
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded.len(), 2);
@@ -748,7 +793,7 @@ async fn max_tokens_finalization_tool_call_falls_back_without_persisting_tool_us
     assert!(
         matches!(
             &last_message.content[..],
-            [ContentBlock::Text { text }] if text == &result.text
+            [ContentBlock::Text { text }] if !text.trim().is_empty()
         ),
         "fallback assistant message should be text-only"
     );
@@ -892,7 +937,7 @@ async fn test_engine_token_usage_tracking() {
 // test_engine_max_turns_runs_one_grace_finalization
 //
 // Verifies that exhausting max_turns after a tool round gets one tool-disabled
-// finalization request before falling back to StopReason::MaxTurns.
+// finalization request while retaining StopReason::MaxTurns for the host.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_engine_max_turns_runs_one_grace_finalization() {
@@ -942,7 +987,7 @@ async fn test_engine_max_turns_runs_one_grace_finalization() {
         .await
         .expect("engine should succeed with grace finalization");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "Final from existing tool result");
     assert_eq!(result.turns, 1);
 
@@ -1025,7 +1070,7 @@ async fn repeated_tool_call_failure_turns_finalize_without_more_tools() {
         .await
         .expect("engine should finalize repeated tool-call-failure loops");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "The tool is blocked by permission settings.");
     assert_eq!(result.turns, 3);
 
@@ -1042,6 +1087,55 @@ async fn repeated_tool_call_failure_turns_finalize_without_more_tools() {
             )
         })
     }));
+}
+
+#[tokio::test]
+async fn recoverable_tool_failure_then_success_finishes_normally() {
+    let provider = Arc::new(FullRecordingRequestProvider::new(vec![
+        tool_call_failure_turn("failed-call"),
+        vec![
+            LlmEvent::ToolUse {
+                id: "repaired-call".into(),
+                name: "repaired_tool".into(),
+                input: json!({}),
+                extra: None,
+            },
+            LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+        ],
+        vec![
+            LlmEvent::TextDelta("Task completed after repair.".into()),
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ],
+    ]));
+    let requests = provider.requests();
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MockTool::new("mock_tool", "invalid argument", true)));
+    registry.register(Box::new(MockTool::new("repaired_tool", "saved output", false)));
+    let mut engine =
+        AgentEngine::new_with_provider(provider, test_config(), registry, silent_output(), std::env::temp_dir());
+
+    let result = engine.run("create output", "recovery-test").await.unwrap();
+
+    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.text, "Task completed after repair.");
+    assert_eq!(result.turns, 3);
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 3);
+    assert!(recorded.iter().all(|request| request.tool_count > 0));
+    for (request_index, call_id, expected_error) in [(1, "failed-call", true), (2, "repaired-call", false)] {
+        assert!(recorded[request_index].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id, is_error, .. }
+                    if tool_use_id == call_id && *is_error == expected_error)
+            })
+        }));
+    }
 }
 
 #[tokio::test]
@@ -1071,7 +1165,7 @@ async fn repeated_tool_call_failure_threshold_one_finalizes_immediately() {
         .await
         .expect("engine should finalize repeated tool-call-failure loops");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "The tool failed because permission was denied.");
     assert_eq!(result.turns, 1);
 
@@ -1109,7 +1203,7 @@ async fn repeated_tool_call_failure_disabled_runs_grace_finalization() {
         .await
         .expect("engine should stop cleanly");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "Final after tool-call failures");
     assert_eq!(result.turns, 2);
 
@@ -1270,7 +1364,7 @@ async fn repeated_tool_call_malformed_disabled_runs_grace_finalization() {
         .await
         .expect("engine should stop cleanly");
 
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
+    assert_eq!(result.stop_reason, StopReason::MaxTurns);
     assert_eq!(result.text, "Final after malformed attempts");
     assert_eq!(result.turns, 2);
 

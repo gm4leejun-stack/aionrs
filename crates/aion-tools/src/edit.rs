@@ -10,6 +10,7 @@ use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
 use crate::file_cache::{FileStateCache, file_mtime_ms, update_cache_after_write};
+use crate::workspace_path::is_within_workspace;
 
 #[derive(Clone, Copy)]
 enum LineEnding {
@@ -114,8 +115,19 @@ fn convert_line_endings(text: &str, line_ending: LineEnding) -> Cow<'_, str> {
     }
 }
 
+fn decode_escaped_text(text: &str) -> Option<String> {
+    if !text.contains('\\') {
+        return None;
+    }
+
+    serde_json::from_str::<String>(&format!("\"{text}\""))
+        .ok()
+        .filter(|decoded| decoded != text)
+}
+
 pub struct EditTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl EditTool {
@@ -128,7 +140,24 @@ impl EditTool {
     ///
     /// Pass `None` to disable all cache-related guards (legacy behavior).
     pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>) -> Self {
-        Self { file_cache }
+        Self {
+            file_cache,
+            workspace: None,
+        }
+    }
+
+    pub fn new_in_workspace(file_cache: Option<Arc<RwLock<FileStateCache>>>, workspace: std::path::PathBuf) -> Self {
+        Self {
+            file_cache,
+            workspace: Some(workspace),
+        }
+    }
+
+    fn allowed_path(&self, file_path: &str) -> bool {
+        let Some(workspace) = &self.workspace else {
+            return true;
+        };
+        is_within_workspace(workspace, Path::new(file_path))
     }
 }
 
@@ -141,6 +170,8 @@ impl Tool for EditTool {
     fn description(&self) -> &str {
         "Performs exact string replacements in files.\n\n\
          Usage:\n\
+         - Input parameters are file_path, old_string, new_string, and optional replace_all.\n\
+         - Do not pass cmd to Edit; cmd belongs to ExecCommand.\n\
          - You must use the Read tool first before editing a file.\n\
          - The old_string must be unique in the file. If multiple matches exist, \
          the edit will fail. Provide more surrounding context to make it unique, \
@@ -181,8 +212,13 @@ impl Tool for EditTool {
 
     async fn execute(&self, input: Value) -> ToolResult {
         let Some(file_path) = input["file_path"].as_str() else {
+            let guidance = if input.get("cmd").is_some() {
+                " The input contains `cmd`, which belongs to ExecCommand, not Edit. Use Edit with `file_path`, `old_string`, and `new_string`."
+            } else {
+                " Edit requires `file_path`, `old_string`, and `new_string`."
+            };
             return ToolResult {
-                content: "Missing required parameter: file_path".to_string(),
+                content: format!("Missing required parameter: file_path.{guidance}"),
                 is_error: true,
             };
         };
@@ -198,6 +234,12 @@ impl Tool for EditTool {
                 is_error: true,
             };
         };
+        if !self.allowed_path(file_path) {
+            return ToolResult {
+                content: format!("Path is outside the workspace and is not allowed: {file_path}"),
+                is_error: true,
+            };
+        }
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
 
         let path = Path::new(file_path);
@@ -246,8 +288,28 @@ impl Tool for EditTool {
 
         // Prefer the exact bytes supplied by the caller. Only fall back to an
         // EOL-adapted old_string when the exact form is absent.
+        let decoded_old_string = decode_escaped_text(old_string);
         let selected = match select_old_string(&content, old_string) {
             Ok(selected) => selected,
+            Err(MatchSelectionError::NotFound) if decoded_old_string.is_some() => {
+                match select_old_string(&content, decoded_old_string.as_deref().unwrap_or_default()) {
+                    Ok(selected) => selected,
+                    Err(MatchSelectionError::NotFound) => {
+                        return ToolResult {
+                            content: "old_string not found in file".to_string(),
+                            is_error: true,
+                        };
+                    }
+                    Err(MatchSelectionError::AmbiguousLineEndings) => {
+                        return ToolResult {
+                            content: "Ambiguous line-ending match: old_string matches both LF and CRLF text. \
+                                      Provide more surrounding context."
+                                .to_string(),
+                            is_error: true,
+                        };
+                    }
+                }
+            }
             Err(MatchSelectionError::NotFound) => {
                 return ToolResult {
                     content: "old_string not found in file".to_string(),

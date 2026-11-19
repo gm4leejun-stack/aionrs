@@ -26,8 +26,8 @@ use crate::session::{Session, SessionManager};
 use crate::stream::StreamOutcome;
 use crate::tool_call::{
     DEFAULT_MAX_TOOL_CALL_FAILURE, DEFAULT_MAX_TOOL_CALL_MALFORMED, ToolCallFailureFingerprint,
-    ToolCallMalformedFingerprint, merge_tool_results, tool_call_failure_fingerprint, tool_call_malformed_fingerprint,
-    tool_call_malformed_reason,
+    ToolCallMalformedFingerprint, merge_tool_results, merge_tool_results_with_capability_errors, repair_tool_call,
+    tool_call_failure_fingerprint, tool_call_malformed_fingerprint, tool_call_malformed_reason,
 };
 use crate::tool_policy::ToolPolicy;
 use crate::turn::{FinalizationReason, ToolLoopWarning, TurnGuardAction, TurnGuards, TurnKind, TurnOutcome};
@@ -40,6 +40,7 @@ use aion_protocol::ToolApprovalManager;
 use aion_protocol::events::ToolCategory;
 use aion_protocol::writer::ProtocolEmitter;
 use aion_providers::provider::{LlmProvider, create_provider};
+use aion_tools::Tool;
 use aion_tools::registry::ToolRegistry;
 use aion_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use aion_types::message::{ContentBlock, ImageInputCapability, Message, Role, StopReason, TokenUsage};
@@ -60,6 +61,22 @@ pub struct AgentResult {
     pub turns: usize,
 }
 
+/// Host-provided resolver for image-input support of the active model.
+///
+/// The engine does not infer vision support from a provider family. Hosts that
+/// own a model catalog may install this hook to resolve an unknown capability
+/// immediately before an image-required tool call is orchestrated.
+#[async_trait::async_trait]
+pub trait ImageCapabilityResolver: Send + Sync {
+    /// Return current local state and whether an unknown result may be probed.
+    /// This must not perform I/O. `None` preserves the legacy resolver behavior.
+    fn snapshot(&self, _model: &str) -> Option<(ImageInputCapability, bool)> {
+        None
+    }
+
+    async fn resolve(&self, model: &str) -> ImageInputCapability;
+}
+
 /// Corrective prompt injected before the single tool-enabled retry that
 /// follows an empty final response. Some models put the intended tool call
 /// (or the whole answer) inside reasoning content; a normal turn with tools
@@ -72,6 +89,8 @@ pub struct AgentEngine {
     provider: Arc<dyn LlmProvider>,
     /// Resolved provider compatibility and capability settings.
     compat: ProviderCompat,
+    /// Optional host-owned resolver for an unknown model image capability.
+    image_capability_resolver: Option<Arc<dyn ImageCapabilityResolver>>,
     /// Optional provider-neutral thinking configuration for model requests.
     thinking: Option<ThinkingConfig>,
     /// Base system prompt sent with each model request.
@@ -209,6 +228,7 @@ impl AgentEngine {
             max_tokens: config.max_tokens,
             thinking: config.thinking,
             compat: config.compat.clone(),
+            image_capability_resolver: None,
             system_prompt,
             reasoning_effort: None,
             messages: Vec::new(),
@@ -308,6 +328,7 @@ impl AgentEngine {
             max_tokens: config.max_tokens,
             thinking: config.thinking,
             compat: config.compat.clone(),
+            image_capability_resolver: None,
             system_prompt,
             reasoning_effort: None,
             messages: session.messages.clone(),
@@ -435,6 +456,19 @@ impl AgentEngine {
     /// the flag when processing `PlanModeTransition` context modifiers.
     pub fn set_plan_active_flag(&mut self, flag: Arc<AtomicBool>) {
         self.plan_active_flag = Some(flag);
+    }
+
+    /// Install a host-owned resolver for unknown image-input capability.
+    pub fn set_image_capability_resolver<R>(&mut self, resolver: R)
+    where
+        R: ImageCapabilityResolver + 'static,
+    {
+        self.image_capability_resolver = Some(Arc::new(resolver));
+    }
+
+    /// Remove the host-owned image-input capability resolver.
+    pub fn clear_image_capability_resolver(&mut self) {
+        self.image_capability_resolver = None;
     }
 }
 
@@ -659,6 +693,7 @@ impl AgentEngine {
     /// Build the next provider request, applying plan-mode tool/system filtering
     /// and recording the prompt state for cache diagnostics.
     fn build_request(&mut self, kind: TurnKind) -> LlmRequest {
+        self.refresh_image_capability();
         let image_input = self.compat.image_input();
         let tools = self.tool_definitions_for_turn(kind);
 
@@ -696,21 +731,35 @@ impl AgentEngine {
 
     fn tool_definitions_for_turn(&self, kind: TurnKind) -> Vec<ToolDef> {
         let image_input = self.compat.image_input();
+        let can_probe = self
+            .image_capability_resolver
+            .as_ref()
+            .is_some_and(|resolver| resolver.snapshot(&self.model).is_none_or(|(_, can_probe)| can_probe));
+        let image_tool_available =
+            image_input.supports_images() || (image_input == ImageInputCapability::Unknown && can_probe);
         if kind.disable_tools() {
             Vec::new()
         } else if self.plan_state.is_active {
             self.tools.to_tool_defs_filtered(|tool| {
                 self.tool_policy.allows(tool.name())
-                    && (!tool.requires_image_input() || image_input.supports_images())
+                    && (!tool.requires_image_input() || image_tool_available)
                     && tool.category() == ToolCategory::Info
                     && tool.name() != "EnterPlanMode"
             })
         } else {
             self.tools.to_tool_defs_filtered(|tool| {
                 self.tool_policy.allows(tool.name())
-                    && (!tool.requires_image_input() || image_input.supports_images())
+                    && (!tool.requires_image_input() || image_tool_available)
                     && tool.name() != "ExitPlanMode"
             })
+        }
+    }
+
+    fn refresh_image_capability(&mut self) {
+        if let Some(resolver) = &self.image_capability_resolver
+            && let Some((capability, _)) = resolver.snapshot(&self.model)
+        {
+            self.compat.image_input = Some(capability);
         }
     }
 
@@ -733,6 +782,41 @@ impl AgentEngine {
             })
             .collect();
         let tool_call_malformed_fingerprint = tool_call_malformed_fingerprint(tool_calls, &tool_call_malformed_reasons);
+
+        // Resolve unknown image support before any image-required tool reaches
+        // orchestration. A resolver is invoked at most once for this batch, and
+        // only when an image-required call is structurally complete: probing is
+        // pointless for a call that the tool itself would reject for missing
+        // required input.
+        let image_ready: Vec<bool> = tool_calls
+            .iter()
+            .zip(&tool_call_malformed_reasons)
+            .map(|(call, malformed_reason)| {
+                if malformed_reason.is_some() {
+                    return false;
+                }
+                let ContentBlock::ToolUse { name, input, .. } = call else {
+                    return false;
+                };
+                self.tool_policy.allows(name)
+                    && self.tools.get(name).is_some_and(|tool| {
+                        tool.requires_image_input() && missing_required_input(tool, input).is_none()
+                    })
+            })
+            .collect();
+
+        self.refresh_image_capability();
+        if self.compat.image_input() == ImageInputCapability::Unknown
+            && let Some(resolver) = self.image_capability_resolver.clone()
+            && resolver.snapshot(&self.model).is_none_or(|(_, can_probe)| can_probe)
+            && image_ready.iter().any(|ready| *ready)
+        {
+            let resolved = resolver.resolve(&self.model).await;
+            self.compat.image_input = Some(resolved);
+        }
+
+        let mut capability_errors: Vec<Option<String>> = vec![None; tool_calls.len()];
+        let resolver_installed = self.image_capability_resolver.is_some();
         let policy_denied_tool_names: Vec<_> = tool_calls
             .iter()
             .zip(&tool_call_malformed_reasons)
@@ -743,19 +827,45 @@ impl AgentEngine {
                 let ContentBlock::ToolUse { name, .. } = call else {
                     return None;
                 };
-                let capability_denied = self
-                    .tools
-                    .get(name)
-                    .is_some_and(|tool| tool.requires_image_input() && !self.compat.image_input().supports_images());
-                (!self.tool_policy.allows(name) || capability_denied).then(|| name.clone())
+                let capability_denied_without_resolver = self.tools.get(name).is_some_and(|tool| {
+                    tool.requires_image_input() && !self.compat.image_input().supports_images() && !resolver_installed
+                });
+                (!self.tool_policy.allows(name) || capability_denied_without_resolver).then(|| name.clone())
             })
             .collect();
+
+        for (index, ((call, malformed_reason), policy_denied_name)) in tool_calls
+            .iter()
+            .zip(&tool_call_malformed_reasons)
+            .zip(&policy_denied_tool_names)
+            .enumerate()
+        {
+            if malformed_reason.is_some() || policy_denied_name.is_some() {
+                continue;
+            }
+            let ContentBlock::ToolUse { name, input, .. } = call else {
+                continue;
+            };
+            let Some(tool) = self.tools.get(name) else {
+                continue;
+            };
+            let requires_image = tool.requires_image_input();
+            if requires_image && !self.compat.image_input().supports_images() && resolver_installed {
+                capability_errors[index] = Some(match missing_required_input(tool, input) {
+                    Some(field) => format!("{name} was not executed: missing required parameter `{field}`"),
+                    None => image_capability_error(name, &self.model, self.compat.image_input()),
+                });
+            }
+        }
         let executable_tool_calls: Vec<_> = tool_calls
             .iter()
             .zip(&tool_call_malformed_reasons)
             .zip(&policy_denied_tool_names)
-            .filter(|((_, malformed_reason), denied_name)| malformed_reason.is_none() && denied_name.is_none())
-            .map(|((call, _), _)| call.clone())
+            .zip(&capability_errors)
+            .filter(|(((_, malformed_reason), denied_name), capability_error)| {
+                malformed_reason.is_none() && denied_name.is_none() && capability_error.is_none()
+            })
+            .map(|(((call, _), _), _)| (*call).clone())
             .collect();
 
         let (executable_results, executable_modifiers, follow_up_blocks) = if executable_tool_calls.is_empty() {
@@ -809,28 +919,54 @@ impl AgentEngine {
             }
         };
 
-        let (tool_results, tool_modifiers) = merge_tool_results(
-            tool_calls,
-            &tool_call_malformed_reasons,
-            &policy_denied_tool_names,
-            executable_results,
-            executable_modifiers,
-        );
+        let (tool_results, tool_modifiers) = if capability_errors.iter().all(Option::is_none) {
+            merge_tool_results(
+                tool_calls,
+                &tool_call_malformed_reasons,
+                &policy_denied_tool_names,
+                executable_results,
+                executable_modifiers,
+            )
+        } else {
+            merge_tool_results_with_capability_errors(
+                tool_calls,
+                &tool_call_malformed_reasons,
+                &capability_errors,
+                &policy_denied_tool_names,
+                executable_results,
+                executable_modifiers,
+            )
+        };
 
         let failed_tool_calls: Vec<_> = tool_calls
             .iter()
             .zip(&tool_call_malformed_reasons)
+            .zip(&capability_errors)
             .zip(&tool_results)
-            .filter(|((_, malformed_reason), result)| {
-                malformed_reason.is_none() && matches!(result, ContentBlock::ToolResult { is_error: true, .. })
+            .filter(|(((_, malformed_reason), capability_error), result)| {
+                malformed_reason.is_none()
+                    && capability_error.is_none()
+                    && matches!(result, ContentBlock::ToolResult { is_error: true, .. })
             })
-            .map(|((call, _), _)| call.clone())
+            .map(|(((call, _), _), _)| call.clone())
             .collect();
         let tool_call_failure_fingerprint = tool_call_failure_fingerprint(&failed_tool_calls);
-        let all_tool_results_error = tool_call_failure_fingerprint.is_some()
-            && tool_results
+        let has_non_capability_calls = tool_calls
+            .iter()
+            .zip(&tool_call_malformed_reasons)
+            .zip(&capability_errors)
+            .any(|((_, malformed_reason), capability_error)| malformed_reason.is_none() && capability_error.is_none());
+        let all_tool_results_error = has_non_capability_calls
+            && tool_call_failure_fingerprint.is_some()
+            && tool_calls
                 .iter()
-                .all(|result| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
+                .zip(&tool_call_malformed_reasons)
+                .zip(&capability_errors)
+                .zip(&tool_results)
+                .filter(|(((_, malformed_reason), capability_error), _)| {
+                    malformed_reason.is_none() && capability_error.is_none()
+                })
+                .all(|(((_, _), _), result)| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
 
         Ok(ToolRoundOutput {
             tool_results,
@@ -918,6 +1054,13 @@ impl AgentEngine {
         counted_turns: usize,
         fallback_stop_reason: StopReason,
     ) -> Result<AgentResult, AgentError> {
+        info!(
+            target: "aion_agent",
+            finalization_reason = ?reason,
+            counted_turns,
+            turn_id = self.current_turn_id.as_deref(),
+            "finalizing agent run with tools disabled"
+        );
         let outcome = self.run_turn(TurnKind::Finalization(reason)).await?;
         let combined_text = format!("{}{}", prefix_text, outcome.assistant_text);
         let is_success = outcome.tool_calls.is_empty()
@@ -930,7 +1073,11 @@ impl AgentEngine {
             self.save_session();
             return Ok(AgentResult {
                 text: combined_text,
-                stop_reason: StopReason::EndTurn,
+                // A summary explains why execution stopped; it cannot clear a guard.
+                stop_reason: match reason {
+                    FinalizationReason::ToolFailure | FinalizationReason::TurnBudget => fallback_stop_reason,
+                    FinalizationReason::MaxTokens | FinalizationReason::EmptyFinal => StopReason::EndTurn,
+                },
                 usage: self.total_usage.clone(),
                 turns: counted_turns,
             });
@@ -960,12 +1107,9 @@ impl AgentEngine {
             }],
         );
         self.save_session();
-        Ok(AgentResult {
-            text: fallback_text,
-            stop_reason: fallback_stop_reason,
-            usage: self.total_usage.clone(),
-            turns: counted_turns,
-        })
+        // Persist partial work for recovery, but never turn a failed
+        // finalization into a successful host Finish event.
+        Err(AgentError::ApiError(fallback.to_string()))
     }
 
     /// Drain one provider stream into a [`StreamOutcome`].
@@ -989,6 +1133,26 @@ impl AgentEngine {
                     assistant_text.push_str(&text);
                 }
                 LlmEvent::ToolUse { id, name, input, extra } => {
+                    let raw_call = ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        extra: extra.clone(),
+                    };
+                    let repaired_call = repair_tool_call(raw_call);
+                    let (id, name, input, extra) = match repaired_call {
+                        Some(ContentBlock::ToolUse { id, name, input, extra }) => {
+                            warn!(
+                                target: "aion_agent",
+                                tool_use_id = %id,
+                                original_tool = "Edit",
+                                repaired_tool = %name,
+                                "repaired unambiguous tool-call parameter misroute"
+                            );
+                            (id, name, input, extra)
+                        }
+                        _ => (id, name, input, extra),
+                    };
                     if id.trim().is_empty() {
                         error!(
                             target: "aion_agent",
@@ -1284,6 +1448,27 @@ fn project_image_input(messages: &mut [Message], capability: ImageInputCapabilit
             message.content.push(ContentBlock::Text { text: text.to_owned() });
         }
     }
+}
+
+fn missing_required_input(tool: &dyn Tool, input: &serde_json::Value) -> Option<String> {
+    let schema = tool.input_schema();
+    let required = schema.get("required")?.as_array()?;
+    required
+        .iter()
+        .filter_map(|item| item.as_str())
+        .find(|field| input.get(*field).is_none())
+        .map(str::to_owned)
+}
+
+fn image_capability_error(tool_name: &str, model: &str, capability: ImageInputCapability) -> String {
+    let status = match capability {
+        ImageInputCapability::Unsupported => "does not support image input",
+        ImageInputCapability::Unknown => "has unknown image-input support",
+        ImageInputCapability::Supported => return String::new(),
+    };
+    format!(
+        "{tool_name} was not executed because model '{model}' {status}; this image has not been viewed. Continue with non-visual checks and disclose the visual verification gap.",
+    )
 }
 
 impl AgentEngine {

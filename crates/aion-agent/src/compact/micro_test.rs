@@ -199,6 +199,31 @@ mod tests {
     // ── microcompact ────────────────────────────────────────────────────
 
     #[test]
+    fn keeps_entire_latest_tool_round_even_when_larger_than_keep_budget() {
+        let mut msgs = vec![
+            assistant_msg(vec![tool_use_block("old", "Read")]),
+            user_msg(vec![tool_result_block("old", "old data")]),
+            assistant_msg((0..8).map(|i| tool_use_block(&format!("new-{i}"), "Read")).collect()),
+            user_msg(
+                (0..8)
+                    .map(|i| tool_result_block(&format!("new-{i}"), "new data"))
+                    .collect(),
+            ),
+        ];
+        let config = CompactConfig {
+            micro_keep_recent: 2,
+            ..default_config()
+        };
+
+        let result = microcompact(&mut msgs, &config);
+
+        assert_eq!(result.cleared_count, 1);
+        assert!(msgs[3].content.iter().all(|block| matches!(block,
+            ContentBlock::ToolResult { content, .. } if content == "new data"
+        )));
+    }
+
+    #[test]
     fn clears_oldest_keeps_recent() {
         // 5 tool results, keep_recent=2  →  clear 3.
         let mut msgs = Vec::new();
@@ -349,6 +374,22 @@ mod tests {
     }
 
     // ── should_microcompact ─────────────────────────────────────────────
+
+    #[test]
+    fn consumed_round_can_be_cleared_after_assistant_reply() {
+        let mut msgs = vec![
+            assistant_msg(vec![tool_use_block("t1", "Read"), tool_use_block("t2", "Read")]),
+            user_msg(vec![tool_result_block("t1", "old")]),
+            user_msg(vec![tool_result_block("t2", "recent"), text_block("follow up")]),
+            assistant_msg(vec![text_block("consumed")]),
+        ];
+        let config = CompactConfig {
+            micro_keep_recent: 1,
+            ..default_config()
+        };
+        assert_eq!(microcompact(&mut msgs, &config).cleared_count, 1);
+        assert!(matches!(&msgs[2].content[0], ContentBlock::ToolResult { content, .. } if content == "recent"));
+    }
 
     #[test]
     fn should_returns_false_when_disabled() {

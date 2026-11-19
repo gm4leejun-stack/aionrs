@@ -56,9 +56,13 @@ impl ToolApprovalManager {
     }
 
     pub fn approve(&self, call_id: &str, scope: ApprovalScope) {
-        let pending = self.pending.lock().ok().and_then(|mut pending| pending.remove(call_id));
-
-        if let Some(pending) = pending {
+        // Keep the pending lock while applying the persistent scope. This
+        // makes approval and cancel_all_pending one linearizable operation:
+        // cancellation cannot interleave between removing the request and
+        // granting its Always scope.
+        if let Ok(mut pending_requests) = self.pending.lock()
+            && let Some(pending) = pending_requests.remove(call_id)
+        {
             if matches!(scope, ApprovalScope::Always) {
                 self.add_auto_approve(&pending.category);
             }
@@ -118,6 +122,26 @@ impl ToolApprovalManager {
     pub fn drop_pending(&self, call_id: &str) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(call_id);
+        }
+    }
+
+    /// Cancel one pending request by dropping its sender.
+    ///
+    /// The waiting engine observes a closed channel and aborts the current
+    /// turn. Dropping the entry also makes a late approval a no-op, so an
+    /// already-cancelled request cannot grant an always-allow scope.
+    pub fn cancel_pending(&self, call_id: &str) {
+        self.drop_pending(call_id);
+    }
+
+    /// Cancel every request currently waiting for user approval.
+    ///
+    /// This is used when the host cancels or kills a turn. All senders are
+    /// dropped before the host releases the turn, and subsequent approvals for
+    /// those call IDs cannot change the session policy.
+    pub fn cancel_all_pending(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
         }
     }
 

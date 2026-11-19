@@ -37,6 +37,7 @@ pub struct AgentSpawner {
     cwd: PathBuf,
     runtime_env: Vec<(String, String)>,
     tool_policy: ToolPolicy,
+    managed_execution: bool,
 }
 
 impl AgentSpawner {
@@ -57,7 +58,13 @@ impl AgentSpawner {
             cwd,
             runtime_env,
             tool_policy,
+            managed_execution: false,
         }
+    }
+
+    pub(crate) fn managed_execution(mut self, enabled: bool) -> Self {
+        self.managed_execution = enabled;
+        self
     }
 
     /// Spawn a single sub-agent and wait for result.
@@ -74,7 +81,7 @@ impl AgentSpawner {
         tracing::info!(target: "aion_agent", cwd = %self.cwd.display(), "sub-agent spawned with workspace cwd");
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &[]);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env, self.managed_execution);
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -137,6 +144,7 @@ impl AgentSpawner {
             cwd: self.cwd.clone(),
             runtime_env: self.runtime_env.clone(),
             tool_policy: self.tool_policy.clone(),
+            managed_execution: self.managed_execution,
         }
     }
 }
@@ -157,7 +165,7 @@ impl Spawner for AgentSpawner {
         }
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &overrides.allowed_tools);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env, self.managed_execution);
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -202,15 +210,22 @@ fn effective_child_tool_policy(parent: &ToolPolicy, allowed_tools: &[String]) ->
     )
 }
 
-fn build_tool_registry(policy: &ToolPolicy, cwd: &Path, runtime_env: &[(String, String)]) -> ToolRegistry {
+fn build_tool_registry(
+    policy: &ToolPolicy,
+    cwd: &Path,
+    runtime_env: &[(String, String)],
+    managed: bool,
+) -> ToolRegistry {
+    let exec = if managed {
+        ExecCommandTool::new_with_env_managed(cwd.to_path_buf(), runtime_env.to_vec())
+    } else {
+        ExecCommandTool::new_with_env(cwd.to_path_buf(), runtime_env.to_vec())
+    };
     let all_tools: Vec<(&str, Box<dyn aion_tools::Tool>)> = vec![
-        ("Read", Box::new(ReadTool::new(None))),
-        ("Write", Box::new(WriteTool::new(None))),
-        ("Edit", Box::new(EditTool::new(None))),
-        (
-            "ExecCommand",
-            Box::new(ExecCommandTool::new_with_env(cwd.to_path_buf(), runtime_env.to_vec())),
-        ),
+        ("Read", Box::new(ReadTool::new_in_workspace(None, cwd.to_path_buf()))),
+        ("Write", Box::new(WriteTool::new_in_workspace(None, cwd.to_path_buf()))),
+        ("Edit", Box::new(EditTool::new_in_workspace(None, cwd.to_path_buf()))),
+        ("ExecCommand", Box::new(exec)),
         ("Grep", Box::new(GrepTool::new(cwd.to_path_buf()))),
         ("Glob", Box::new(GlobTool::new(cwd.to_path_buf()))),
     ];

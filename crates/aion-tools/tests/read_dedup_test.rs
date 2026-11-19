@@ -46,7 +46,7 @@ async fn tc_5_3_01_first_read_returns_full_content() {
     );
 }
 
-/// TC-5.3-02: Second read of the same unchanged file returns the dedup stub.
+/// TC-5.3-02: Second read replays the same unchanged content.
 #[tokio::test]
 async fn tc_5_3_02_dedup_on_unchanged_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -63,13 +63,10 @@ async fn tc_5_3_02_dedup_on_unchanged_file() {
     assert!(!r1.is_error);
     assert!(r1.content.contains("line one"));
 
-    // Second read: unchanged stub.
+    // Second read remains self-contained.
     let r2 = tool.execute(input).await;
     assert!(!r2.is_error);
-    assert!(
-        r2.content.contains(UNCHANGED_MARKER),
-        "Second read of unchanged file should return the dedup stub"
-    );
+    assert_eq!(r2.content, r1.content);
 }
 
 /// TC-5.3-03: After external modification, re-read returns new content.
@@ -174,7 +171,7 @@ async fn tc_5_3_06_nonexistent_file_error_no_cache() {
     assert!(c.is_empty(), "Failed reads must not populate the cache");
 }
 
-/// TC-5.3-07: Empty file can be deduped on second read.
+/// TC-5.3-07: Cached empty files still return empty content.
 #[tokio::test]
 async fn tc_5_3_07_empty_file_dedup() {
     let dir = tempfile::tempdir().unwrap();
@@ -191,13 +188,10 @@ async fn tc_5_3_07_empty_file_dedup() {
 
     let r2 = tool.execute(input).await;
     assert!(!r2.is_error);
-    assert!(
-        r2.content.contains(UNCHANGED_MARKER),
-        "Empty file should be deduped on second read"
-    );
+    assert!(r2.content.is_empty());
 }
 
-/// Supplementary: Same range read twice returns dedup stub.
+/// Supplementary: Same range read twice replays the same content.
 #[tokio::test]
 async fn same_range_dedup() {
     let dir = tempfile::tempdir().unwrap();
@@ -216,10 +210,7 @@ async fn same_range_dedup() {
 
     let r2 = tool.execute(input).await;
     assert!(!r2.is_error);
-    assert!(
-        r2.content.contains(UNCHANGED_MARKER),
-        "Same range on unchanged file should trigger dedup"
-    );
+    assert_eq!(r2.content, r1.content);
 }
 
 /// Supplementary: Cache entry is updated after modification + re-read.
@@ -245,10 +236,7 @@ async fn cache_updated_after_modification() {
     let r2 = tool.execute(input.clone()).await;
     assert!(r2.content.contains("v2"));
 
-    // Third read: should dedup on v2.
+    // Third read replays v2 from the refreshed cache.
     let r3 = tool.execute(input).await;
-    assert!(
-        r3.content.contains(UNCHANGED_MARKER),
-        "After re-read of modified file, cache should be updated and third read deduped"
-    );
+    assert_eq!(r3.content, r2.content);
 }

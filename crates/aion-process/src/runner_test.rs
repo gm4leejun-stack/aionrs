@@ -6,7 +6,80 @@ mod tests {
 
     use tokio::process::Command;
 
-    use super::CommandRunner;
+    use super::{CleanupStatus, CommandRunner, DEFAULT_TIMEOUT};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_cancellation_returns_cleanup_confirmation() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!(
+            "aion-process-managed-cancel-{}-{stamp}.pid",
+            std::process::id()
+        ));
+        let mut command = shell_command("sleep 10 & printf '%s' \"$!\" > \"$AION_TEST_PID_FILE\"; wait");
+        command.env("AION_TEST_PID_FILE", &pid_file);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let runner = tokio::spawn(CommandRunner::new(command).run_with_cancel(async move {
+            let _ = cancel_rx.await;
+        }));
+
+        let child_pid = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child should report its pid before cancellation");
+
+        cancel_tx.send(()).expect("runner should still await cancellation");
+        let result = runner
+            .await
+            .expect("runner task should join")
+            .expect("cleanup should succeed");
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(result.cancelled);
+        assert_eq!(result.cleanup, CleanupStatus::Confirmed);
+        assert_process_exits(child_pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_timeout_uses_cancellation_instead_of_wall_clock_timeout() {
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let runner = tokio::spawn(
+            CommandRunner::new(shell_command("sleep 5"))
+                .timeout(Duration::ZERO)
+                .without_timeout()
+                .run_with_cancel(async move {
+                    let _ = cancel_rx.await;
+                }),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_tx.send(()).expect("runner should still be active");
+        let result = runner.await.unwrap().unwrap();
+        assert!(result.cancelled);
+        assert_eq!(result.cleanup, CleanupStatus::Confirmed);
+    }
+
+    #[test]
+    fn runner_timeout_policy_is_legacy_by_default_and_optional() {
+        assert_eq!(
+            CommandRunner::new(shell_command("echo test")).timeout,
+            Some(DEFAULT_TIMEOUT)
+        );
+        assert_eq!(
+            CommandRunner::new(shell_command("echo test")).without_timeout().timeout,
+            None
+        );
+    }
 
     #[tokio::test]
     async fn runner_preserves_stdout_emitted_before_timeout() {
@@ -100,6 +173,66 @@ mod tests {
             "stdout was: {}",
             String::from_utf8_lossy(&result.stdout)
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn runner_cancellation_kills_process_group() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!("aion-process-cancel-{}-{stamp}.pid", std::process::id()));
+        #[cfg(unix)]
+        let script = "sleep 10 & printf '%s' \"$!\" > \"$AION_TEST_PID_FILE\"; wait";
+        #[cfg(windows)]
+        let script = "$p = Start-Process -FilePath powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 10' -PassThru -WindowStyle Hidden; [System.IO.File]::WriteAllText($env:AION_TEST_PID_FILE, [string]$p.Id); Wait-Process -Id $p.Id";
+        let mut command = shell_command(script);
+        command.env("AION_TEST_PID_FILE", &pid_file);
+        let runner = tokio::spawn(CommandRunner::new(command).run());
+        let child_pid = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        let _ = std::fs::remove_file(&pid_file);
+        let child_pid = child_pid.expect("child should report its pid before cancellation");
+        for _ in 0..20 {
+            if !process_alive(child_pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Clean up the test child even when the regression assertion fails.
+        terminate_process(child_pid);
+        panic!("background process {child_pid} survived runner cancellation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_completed_command_keeps_background_descendant_running() {
+        let result = CommandRunner::new(shell_command("sleep 10 & echo $!"))
+            .run()
+            .await
+            .expect("runner should complete successfully");
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, Some(0));
+        let sleep_pid = String::from_utf8_lossy(&result.stdout)
+            .lines()
+            .find_map(|line| line.trim().parse::<u32>().ok())
+            .expect("script should print background sleep pid");
+        let alive = process_alive(sleep_pid);
+        terminate_process(sleep_pid);
+        assert!(alive, "normal completion must preserve intentional background work");
     }
 
     #[cfg(unix)]
@@ -251,5 +384,11 @@ mod tests {
 
         unsafe { TerminateProcess(handle, 1) };
         unsafe { CloseHandle(handle) };
+    }
+
+    #[cfg(unix)]
+    fn terminate_process(pid: u32) {
+        let target = i32::try_from(pid).unwrap();
+        unsafe { libc::kill(target, libc::SIGKILL) };
     }
 }

@@ -9,9 +9,11 @@ use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::Tool;
 use crate::file_cache::{FileStateCache, update_cache_after_write};
+use crate::workspace_path::is_within_workspace;
 
 pub struct WriteTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl WriteTool {
@@ -25,7 +27,24 @@ impl WriteTool {
     ///
     /// Pass `None` to disable cache integration (legacy behavior).
     pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>) -> Self {
-        Self { file_cache }
+        Self {
+            file_cache,
+            workspace: None,
+        }
+    }
+
+    pub fn new_in_workspace(file_cache: Option<Arc<RwLock<FileStateCache>>>, workspace: std::path::PathBuf) -> Self {
+        Self {
+            file_cache,
+            workspace: Some(workspace),
+        }
+    }
+
+    fn allowed_path(&self, file_path: &str) -> bool {
+        let Some(workspace) = &self.workspace else {
+            return true;
+        };
+        is_within_workspace(workspace, Path::new(file_path))
     }
 }
 
@@ -38,6 +57,7 @@ impl Tool for WriteTool {
     fn description(&self) -> &str {
         "Writes content to a file, creating parent directories if needed.\n\n\
          Usage:\n\
+         - `content` is the literal file content to write; do not include shell commands such as `test -f ... && python3 ...` in the file unless they are intentionally part of the file.\n\
          - This tool overwrites the existing file completely (not append).\n\
          - If the file already exists, you must use Read first to see its current content.\n\
          - Prefer Edit over Write for modifying existing files — Edit only sends the diff.\n\
@@ -78,6 +98,12 @@ impl Tool for WriteTool {
                 is_error: true,
             };
         };
+        if !self.allowed_path(file_path) {
+            return ToolResult {
+                content: format!("Path is outside the workspace and is not allowed: {file_path}"),
+                is_error: true,
+            };
+        }
 
         let path = Path::new(file_path);
         let existed = path.exists();

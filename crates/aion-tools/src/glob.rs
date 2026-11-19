@@ -1,7 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::task::{spawn_blocking, yield_now};
+use tokio::time::timeout;
 
 use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
@@ -9,6 +14,71 @@ use aion_types::tool::{JsonSchema, ToolResult};
 use crate::Tool;
 
 const MAX_RESULTS: usize = 100;
+const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ScanCancellation(Arc<AtomicBool>);
+
+impl Drop for ScanCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+fn scan_error(message: &str) -> ToolResult {
+    ToolResult {
+        content: message.to_owned(),
+        is_error: true,
+    }
+}
+
+fn scan_files(full_pattern: String, root_path: PathBuf, cancelled: &AtomicBool, deadline: Instant) -> ToolResult {
+    if cancelled.load(Ordering::Relaxed) {
+        return scan_error("Glob scan cancelled");
+    }
+    if Instant::now() >= deadline {
+        return scan_error("Glob scan timed out; narrow the root directory or pattern");
+    }
+    let mut entries = match glob::glob(&full_pattern) {
+        Ok(paths) => paths,
+        Err(error) => return scan_error(&format!("Invalid glob pattern: {error}")),
+    };
+    let mut files: Vec<(SystemTime, String)> = Vec::new();
+    while files.len() < MAX_RESULTS {
+        if cancelled.load(Ordering::Relaxed) {
+            return scan_error("Glob scan cancelled");
+        }
+        if Instant::now() >= deadline {
+            return scan_error("Glob scan timed out; narrow the root directory or pattern");
+        }
+        let next = entries.next();
+        if cancelled.load(Ordering::Relaxed) {
+            return scan_error("Glob scan cancelled");
+        }
+        if Instant::now() >= deadline {
+            return scan_error("Glob scan timed out; narrow the root directory or pattern");
+        }
+        let Some(entry) = next else { break };
+        let Ok(path) = entry else { continue };
+        if !path.is_file() {
+            continue;
+        }
+        let mtime = path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let display_path = path.strip_prefix(&root_path).unwrap_or(&path).display().to_string();
+        files.push((mtime, display_path));
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
+    ToolResult {
+        content: if files.is_empty() {
+            "No files matched the pattern".to_owned()
+        } else {
+            files.into_iter().map(|(_, path)| path).collect::<Vec<_>>().join("\n")
+        },
+        is_error: false,
+    }
+}
 
 pub struct GlobTool {
     cwd: PathBuf,
@@ -71,8 +141,6 @@ impl Tool for GlobTool {
             PathBuf::from(root)
         };
 
-        tracing::debug!(cwd = %self.cwd.display(), resolved_root = %root_path.display(), pattern = %pattern, "GlobTool scanning");
-
         // Build full glob pattern
         let full_pattern = if pattern.starts_with('/') {
             pattern.to_string()
@@ -80,55 +148,27 @@ impl Tool for GlobTool {
             format!("{}/{}", root_path.display(), pattern)
         };
 
-        let entries = match glob::glob(&full_pattern) {
-            Ok(paths) => paths,
-            Err(e) => {
-                return ToolResult {
-                    content: format!("Invalid glob pattern: {}", e),
-                    is_error: true,
-                };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _guard = ScanCancellation(Arc::clone(&cancelled));
+        let deadline = Instant::now() + SCAN_TIMEOUT;
+        // Blocking filesystem operations cannot be forcibly aborted. The worker
+        // checks cancellation between entries; the runtime remains responsive.
+        yield_now().await;
+        let worker = spawn_blocking(move || scan_files(full_pattern, root_path, &cancelled, deadline));
+        match timeout(SCAN_TIMEOUT, worker).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                tracing::error!(tool = "Glob", failure_kind = "scan_worker", "Glob worker failed");
+                scan_error("Glob scan worker failed")
             }
-        };
-
-        let mut files: Vec<(std::time::SystemTime, String)> = Vec::new();
-
-        for entry in entries {
-            if files.len() >= MAX_RESULTS {
-                break;
+            Err(_) => {
+                tracing::warn!(
+                    tool = "Glob",
+                    timeout_secs = SCAN_TIMEOUT.as_secs(),
+                    "Glob scan deadline reached"
+                );
+                scan_error("Glob scan timed out; narrow the root directory or pattern")
             }
-
-            let Ok(path) = entry else {
-                continue;
-            };
-            if !path.is_file() {
-                continue;
-            }
-
-            let mtime = path
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-            // Make path relative to root
-            let display_path = path.strip_prefix(&root_path).unwrap_or(&path).display().to_string();
-
-            files.push((mtime, display_path));
-        }
-
-        // Sort by modification time, newest first
-        files.sort_by_key(|f| std::cmp::Reverse(f.0));
-
-        if files.is_empty() {
-            return ToolResult {
-                content: "No files matched the pattern".to_string(),
-                is_error: false,
-            };
-        }
-
-        let result: Vec<String> = files.into_iter().map(|(_, path)| path).collect();
-        ToolResult {
-            content: result.join("\n"),
-            is_error: false,
         }
     }
 

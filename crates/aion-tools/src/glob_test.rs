@@ -110,4 +110,65 @@ mod tests {
             result.content
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_yields_to_the_runtime_before_filesystem_work_completes() {
+        use std::task::Poll;
+
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("marker.txt"), "hello").unwrap();
+        let tool = GlobTool::new(tmp.path().to_path_buf());
+        let mut scan = Box::pin(tool.execute(json!({"pattern": "*.txt"})));
+        let yielded = std::future::poll_fn(|cx| Poll::Ready(matches!(scan.as_mut().poll(cx), Poll::Pending))).await;
+        assert!(yielded, "filesystem traversal must not block the async runtime");
+        assert!(!scan.await.is_error);
+    }
+
+    #[test]
+    fn dropping_scan_guard_signals_the_worker_to_stop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = ScanCancellation(Arc::clone(&cancelled));
+        drop(guard);
+        assert!(cancelled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancelled_scan_returns_an_error_without_partial_success() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        let tmp = tempdir().unwrap();
+        let pattern = format!("{}/*.txt", tmp.path().display());
+        let result = scan_files(
+            pattern,
+            tmp.path().to_path_buf(),
+            &AtomicBool::new(true),
+            Instant::now() + SCAN_TIMEOUT,
+        );
+        assert!(result.is_error);
+        assert_eq!(result.content, "Glob scan cancelled");
+    }
+
+    #[test]
+    fn expired_scan_returns_a_timeout_not_no_matches() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        let tmp = tempdir().unwrap();
+        let pattern = format!("{}/*.txt", tmp.path().display());
+        let result = scan_files(
+            pattern,
+            tmp.path().to_path_buf(),
+            &AtomicBool::new(false),
+            Instant::now(),
+        );
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            "Glob scan timed out; narrow the root directory or pattern"
+        );
+    }
 }

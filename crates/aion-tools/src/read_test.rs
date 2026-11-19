@@ -7,6 +7,19 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn read_rejects_path_outside_workspace() {
+        let dir = tempdir().unwrap();
+        let tool = ReadTool::new_in_workspace(None, dir.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "/tmp/outside.txt"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("outside the workspace"));
+    }
+
     use aion_config::file_cache::FileCacheConfig;
 
     fn make_cache() -> Arc<RwLock<FileStateCache>> {
@@ -16,6 +29,33 @@ mod tests {
             enabled: true,
         };
         Arc::new(RwLock::new(FileStateCache::new(&config)))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn uncached_read_yields_before_filesystem_work() {
+        use std::task::Poll;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello\n").unwrap();
+        let tool = ReadTool::new(None);
+        let mut read = Box::pin(tool.execute(json!({"file_path": file_path})));
+        let yielded = std::future::poll_fn(|cx| Poll::Ready(matches!(read.as_mut().poll(cx), Poll::Pending))).await;
+        assert!(yielded, "file reads must not block the async runtime");
+        assert!(read.await.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn oversized_offset_and_limit_do_not_overflow() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello\n").unwrap();
+        let tool = ReadTool::new(None);
+        let result = tool
+            .execute(json!({"file_path": file_path, "offset": usize::MAX, "limit": usize::MAX}))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.is_empty());
     }
 
     // -- Basic read tests (no cache) --
@@ -114,7 +154,7 @@ mod tests {
     // -- Dedup tests (with cache) --
 
     #[tokio::test]
-    async fn dedup_returns_stub_on_unchanged_file() {
+    async fn cached_read_replays_content_when_previous_result_is_unavailable() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("dedup.txt");
         std::fs::write(&file_path, "hello\n").unwrap();
@@ -129,10 +169,10 @@ mod tests {
         assert!(!r1.is_error);
         assert!(r1.content.contains("hello"));
 
-        // Second read: dedup stub.
+        // The caller may have compacted the previous result out of its context.
         let r2 = tool.execute(input).await;
         assert!(!r2.is_error);
-        assert_eq!(r2.content, FILE_UNCHANGED_STUB);
+        assert_eq!(r2.content, r1.content);
     }
 
     #[tokio::test]
@@ -189,7 +229,7 @@ mod tests {
         let r2 = tool.execute(input2).await;
         assert!(!r2.is_error);
         assert!(r2.content.contains("line 11"));
-        assert!(!r2.content.contains(FILE_UNCHANGED_STUB));
+        assert!(r2.content.contains("line 20"));
     }
 
     #[tokio::test]
@@ -206,7 +246,7 @@ mod tests {
 
         let r2 = tool.execute(input).await;
         assert!(r2.content.contains("data"));
-        assert_ne!(r2.content, FILE_UNCHANGED_STUB);
+        assert_eq!(r2.content, r1.content);
     }
 
     #[tokio::test]
@@ -239,6 +279,6 @@ mod tests {
 
         let r2 = tool.execute(input).await;
         assert!(!r2.is_error);
-        assert_eq!(r2.content, FILE_UNCHANGED_STUB);
+        assert!(r2.content.is_empty());
     }
 }

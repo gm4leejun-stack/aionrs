@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::io::{Error, Result};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +17,7 @@ pub const DEFAULT_POST_PROCESS_DRAIN: Duration = Duration::from_millis(250);
 /// Runs one process and buffers its stdout/stderr while it is running.
 pub struct CommandRunner {
     command: Command,
-    timeout: Duration,
+    timeout: Option<Duration>,
     post_process_drain: Duration,
 }
 
@@ -23,13 +25,20 @@ impl CommandRunner {
     pub fn new(command: Command) -> Self {
         Self {
             command,
-            timeout: DEFAULT_TIMEOUT,
+            timeout: Some(DEFAULT_TIMEOUT),
             post_process_drain: DEFAULT_POST_PROCESS_DRAIN,
         }
     }
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Disable the runner's wall-clock timeout. Cancellation and process
+    /// containment remain unchanged.
+    pub fn without_timeout(mut self) -> Self {
+        self.timeout = None;
         self
     }
 
@@ -38,7 +47,34 @@ impl CommandRunner {
         self
     }
 
-    pub async fn run(mut self) -> Result<CommandResult> {
+    pub async fn run(self) -> Result<CommandResult> {
+        let result = self.run_with_cancel_policy(std::future::pending::<()>(), false).await?;
+        Ok(CommandResult {
+            exit_code: result.exit_code,
+            timed_out: result.timed_out,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        })
+    }
+
+    /// Runs a process until it completes, times out, or the supplied future
+    /// resolves. Cancellation performs explicit containment termination and
+    /// waits for the direct child before returning a confirmation result.
+    pub async fn run_with_cancel<F>(self, cancellation: F) -> Result<ManagedCommandResult>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        self.run_with_cancel_policy(cancellation, true).await
+    }
+
+    async fn run_with_cancel_policy<F>(
+        mut self,
+        cancellation: F,
+        strict_timeout_cleanup: bool,
+    ) -> Result<ManagedCommandResult>
+    where
+        F: Future<Output = ()> + Send,
+    {
         self.command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -46,8 +82,7 @@ impl CommandRunner {
         ChildContainment::configure(&mut self.command);
 
         let mut child = self.command.spawn()?;
-        let child_id = child.id();
-        let containment = ChildContainment::attach(&mut child)?;
+        let mut containment = ChildContainment::attach(&mut child)?;
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
 
@@ -60,9 +95,16 @@ impl CommandRunner {
             .take()
             .map(|reader| read_stream(reader, Arc::clone(&stderr)));
 
-        match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(status) => {
+        let timeout: Pin<Box<dyn Future<Output = ()> + Send>> = match self.timeout {
+            Some(duration) => Box::pin(tokio::time::sleep(duration)),
+            None => Box::pin(std::future::pending::<()>()),
+        };
+        let outcome: Result<ManagedCommandResult> = tokio::select! {
+            status = child.wait() => {
                 let status = status?;
+                // Successful command completion may intentionally leave a
+                // background process running. Only in-flight cancellation kills it.
+                containment.disarm();
                 let (stdout_result, stderr_result) = tokio::join!(
                     drain_reader_with_result(stdout_reader, self.post_process_drain),
                     drain_reader_with_result(stderr_reader, self.post_process_drain)
@@ -70,16 +112,29 @@ impl CommandRunner {
                 stdout_result?;
                 stderr_result?;
 
-                Ok(CommandResult {
+                Ok(ManagedCommandResult {
                     exit_code: status.code(),
                     timed_out: false,
+                    cancelled: false,
+                    cleanup: CleanupStatus::NotNeeded,
                     stdout: take_output(stdout),
                     stderr: take_output(stderr),
                 })
             }
-            Err(_) => {
-                containment.terminate(&mut child, child_id)?;
-                if let Ok(status) = tokio::time::timeout(self.post_process_drain, child.wait()).await {
+            _ = timeout => {
+                containment.terminate(&mut child)?;
+                if !strict_timeout_cleanup {
+                    // Preserve the legacy `run()` contract: the containment
+                    // kill was issued successfully even if the bounded wait
+                    // below cannot confirm child exit.
+                    containment.disarm();
+                }
+                let wait_result = tokio::time::timeout(self.post_process_drain, child.wait()).await;
+                if strict_timeout_cleanup {
+                    wait_result
+                        .map_err(|_| Error::other("process did not exit after timeout cleanup"))??;
+                    containment.disarm();
+                } else if let Ok(status) = wait_result {
                     status?;
                 }
                 tokio::join!(
@@ -87,15 +142,55 @@ impl CommandRunner {
                     drain_reader(stderr_reader, self.post_process_drain)
                 );
 
-                Ok(CommandResult {
+                Ok(ManagedCommandResult {
                     exit_code: None,
                     timed_out: true,
+                    cancelled: false,
+                    cleanup: CleanupStatus::Confirmed,
                     stdout: take_output(stdout),
                     stderr: take_output(stderr),
                 })
             }
-        }
+            _ = cancellation => {
+                containment.terminate(&mut child)?;
+                let status = tokio::time::timeout(self.post_process_drain, child.wait())
+                    .await
+                    .map_err(|_| Error::other("process did not exit after cancellation cleanup"))??;
+                containment.disarm();
+                tokio::join!(
+                    drain_reader(stdout_reader, self.post_process_drain),
+                    drain_reader(stderr_reader, self.post_process_drain)
+                );
+
+                Ok(ManagedCommandResult {
+                    exit_code: status.code(),
+                    timed_out: false,
+                    cancelled: true,
+                    cleanup: CleanupStatus::Confirmed,
+                    stdout: take_output(stdout),
+                    stderr: take_output(stderr),
+                })
+            }
+        };
+
+        outcome
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupStatus {
+    NotNeeded,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCommandResult {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    pub cleanup: CleanupStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

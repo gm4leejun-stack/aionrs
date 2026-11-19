@@ -7,7 +7,6 @@ use crate::tool_call::{
 };
 use aion_types::message::StopReason;
 
-const EXACT_FAILURE_WARNING_COUNT: usize = 2;
 const ALL_ERROR_ROUND_WARNING_COUNT: usize = 3;
 const TOOL_CALL_CYCLE_WARNING_REPETITIONS: usize = 2;
 
@@ -253,6 +252,7 @@ impl TurnGuards {
 
         let tool_call_failure_count = self.tool_call_failures.observe(tool_call_failure_fingerprint.clone());
         let all_error_round_count = self.all_error_tool_rounds.observe(all_tool_results_error);
+        let has_tool_call_failure = tool_call_failure_fingerprint.is_some();
         let cycle = self.tool_call_cycles.observe(tool_call_failure_fingerprint);
         if cycle.is_none() {
             self.tool_call_cycle_warning_emitted = false;
@@ -298,15 +298,6 @@ impl TurnGuards {
             return TurnGuardAction::Finalize(FinalizationReason::TurnBudget);
         }
 
-        if self.tool_call_failures.limit() > EXACT_FAILURE_WARNING_COUNT
-            && tool_call_failure_count == EXACT_FAILURE_WARNING_COUNT
-        {
-            return TurnGuardAction::Warn(ToolLoopWarning::ExactFailure {
-                count: tool_call_failure_count,
-                limit: self.tool_call_failures.limit(),
-            });
-        }
-
         if let Some(ToolCallCycle { period, repetitions }) = cycle
             && repetitions == TOOL_CALL_CYCLE_WARNING_REPETITIONS
             && !self.tool_call_cycle_warning_emitted
@@ -325,6 +316,17 @@ impl TurnGuards {
             return TurnGuardAction::Warn(ToolLoopWarning::AllErrorRounds {
                 count: all_error_round_count,
                 limit: self.all_error_tool_rounds.limit(),
+            });
+        }
+
+        if has_tool_call_failure
+            && self.tool_call_failures.limit() > 0
+            && tool_call_failure_count <= 2
+            && all_error_round_count < ALL_ERROR_ROUND_WARNING_COUNT
+        {
+            return TurnGuardAction::Warn(ToolLoopWarning::ExactFailure {
+                count: tool_call_failure_count,
+                limit: self.tool_call_failures.limit(),
             });
         }
 

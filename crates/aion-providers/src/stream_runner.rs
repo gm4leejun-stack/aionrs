@@ -69,6 +69,7 @@ where
     };
 
     let (tx, rx) = mpsc::channel(64);
+    let cancel_sender = tx.clone();
 
     let stream_span = tracing::Span::current();
     let stream_task = async move {
@@ -140,7 +141,13 @@ where
             }
         }
     };
-    tokio::spawn(stream_task.instrument(stream_span));
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = cancel_sender.closed() => {}
+            _ = stream_task.instrument(stream_span) => {}
+        }
+    });
 
     Ok(rx)
 }

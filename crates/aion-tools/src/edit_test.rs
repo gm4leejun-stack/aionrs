@@ -6,6 +6,21 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn edit_rejects_path_outside_workspace() {
+        let dir = tempdir().unwrap();
+        let tool = EditTool::new_in_workspace(None, dir.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "/tmp/outside.txt",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("outside the workspace"));
+    }
+
     use crate::file_cache::update_cache_after_write;
     use aion_config::file_cache::FileCacheConfig;
 
@@ -70,6 +85,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_missing_file_path_with_cmd_explains_tool_parameter_mismatch() {
+        let tool = EditTool::new(None);
+        let result = tool
+            .execute(json!({
+                "cmd": "python3 -c 'print(1)'"
+            }))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("ExecCommand"), "got: {}", result.content);
+        assert!(result.content.contains("file_path"), "got: {}", result.content);
+        assert!(result.content.contains("old_string"), "got: {}", result.content);
+        assert!(result.content.contains("new_string"), "got: {}", result.content);
+    }
+
+    #[tokio::test]
     async fn test_edit_preserves_surrounding() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
@@ -87,6 +118,28 @@ mod tests {
         assert!(!result.is_error, "unexpected error: {}", result.content);
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "aaa\nXXX\nccc\n");
+    }
+
+    #[tokio::test]
+    async fn edit_accepts_json_escaped_multiline_old_string() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("escaped.txt");
+        std::fs::write(&file_path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let tool = EditTool::new(None);
+        let result = tool
+            .execute(json!({
+                "file_path": file_path.to_str().unwrap(),
+                "old_string": "alpha\\nbeta",
+                "new_string": "alpha\nbeta updated"
+            }))
+            .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha\nbeta updated\ngamma\n"
+        );
     }
 
     #[tokio::test]

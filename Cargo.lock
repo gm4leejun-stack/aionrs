@@ -152,6 +152,7 @@ version = "0.2.11"
 dependencies = [
  "libc",
  "tokio",
+ "tracing",
  "windows-sys 0.61.2",
  "workspace-hack",
 ]

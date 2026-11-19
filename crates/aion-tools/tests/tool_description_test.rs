@@ -64,6 +64,15 @@ fn exec_command_description_contains_parallel_guidance() {
 }
 
 #[test]
+fn exec_command_description_requires_diagnosis_before_retrying_failures() {
+    let tool = ExecCommandTool::new(test_cwd());
+    let desc = tool.description().to_lowercase();
+    assert!(desc.contains("fails") || desc.contains("failed") || desc.contains("failure"));
+    assert!(desc.contains("retry") || desc.contains("re-run") || desc.contains("again"));
+    assert!(desc.contains("traceback") || desc.contains("error"));
+}
+
+#[test]
 fn exec_command_schema_uses_cmd_and_optional_shell() {
     let tool = ExecCommandTool::new(test_cwd());
     let schema = tool.input_schema();
@@ -143,6 +152,19 @@ fn edit_description_mentions_replace_all() {
     );
 }
 
+#[test]
+fn edit_description_documents_exact_input_parameters() {
+    let tool = EditTool::new(None);
+    let desc = tool.description();
+    for parameter in ["file_path", "old_string", "new_string", "replace_all"] {
+        assert!(desc.contains(parameter), "Edit description should document {parameter}");
+    }
+    assert!(
+        desc.contains("cmd"),
+        "Edit description should distinguish ExecCommand's cmd parameter"
+    );
+}
+
 // --- TC-4.2-04: Write tool description contains operation semantics ---
 
 #[test]
@@ -172,6 +194,17 @@ fn write_description_prefers_edit() {
     assert!(
         desc.contains("Edit"),
         "Write description should recommend Edit for modifications"
+    );
+}
+
+#[test]
+fn write_description_separates_file_content_from_shell_commands() {
+    let tool = WriteTool::new(None);
+    let desc = tool.description();
+    assert!(desc.contains("content"));
+    assert!(
+        desc.contains("shell") || desc.contains("command"),
+        "Write description should clarify that content is file content, not a shell command"
     );
 }
 
