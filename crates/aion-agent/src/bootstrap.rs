@@ -73,6 +73,7 @@ pub struct AgentBootstrap {
     resume_session: Option<Session>,
     runtime_env: Vec<(String, String)>,
     tool_policy: ToolPolicy,
+    managed_execution: bool,
 }
 
 struct BootstrapEnvironment {
@@ -111,6 +112,7 @@ impl AgentBootstrap {
             resume_session: None,
             runtime_env: Vec::new(),
             tool_policy: ToolPolicy::default(),
+            managed_execution: false,
         }
     }
 
@@ -135,6 +137,13 @@ impl AgentBootstrap {
     /// Restrict which registered tools can be advertised and executed.
     pub fn tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
         self.tool_policy = tool_policy;
+        self
+    }
+
+    /// Enable host-managed commands and skill shell steps without default
+    /// wall-clock deadlines. Standalone callers retain legacy limits by default.
+    pub fn managed_execution(mut self, enabled: bool) -> Self {
+        self.managed_execution = enabled;
         self
     }
 
@@ -229,10 +238,12 @@ impl AgentBootstrap {
             file_cache,
             workspace_path.to_path_buf(),
         )));
-        registry.register(Box::new(ExecCommandTool::new_with_env(
-            workspace_path.to_path_buf(),
-            self.runtime_env.clone(),
-        )));
+        let exec = if self.managed_execution {
+            ExecCommandTool::new_with_env_managed(workspace_path.to_path_buf(), self.runtime_env.clone())
+        } else {
+            ExecCommandTool::new_with_env(workspace_path.to_path_buf(), self.runtime_env.clone())
+        };
+        registry.register(Box::new(exec));
         registry.register(Box::new(GrepTool::new(workspace_path.to_path_buf())));
         registry.register(Box::new(GlobTool::new(workspace_path.to_path_buf())));
         registry.register(Box::new(ViewImageTool::new()));
@@ -351,11 +362,10 @@ impl AgentBootstrap {
             self.config.tools.skills.allow.clone(),
             self.config.tools.auto_approve,
         );
-        registry.register(Box::new(SkillTool::new(
-            Arc::new(skills),
-            self.workspace.to_path_buf(),
-            skill_checker,
-        )));
+        registry.register(Box::new(
+            SkillTool::new(Arc::new(skills), self.workspace.to_path_buf(), skill_checker)
+                .managed_execution(self.managed_execution),
+        ));
 
         let spawner = AgentSpawner::new_with_env(
             Arc::clone(provider),
@@ -363,7 +373,8 @@ impl AgentBootstrap {
             workspace.to_path_buf(),
             self.runtime_env.clone(),
             self.tool_policy.clone(),
-        );
+        )
+        .managed_execution(self.managed_execution);
         registry.register(Box::new(SpawnTool::new(Arc::new(spawner))));
     }
 

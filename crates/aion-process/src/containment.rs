@@ -23,9 +23,7 @@ impl ChildContainment {
     }
 
     pub(crate) fn terminate(&mut self, child: &mut Child) -> Result<()> {
-        terminate_child(child, self)?;
-        self.disarm();
-        Ok(())
+        terminate_child(child, self)
     }
 
     pub(crate) fn disarm(&mut self) {

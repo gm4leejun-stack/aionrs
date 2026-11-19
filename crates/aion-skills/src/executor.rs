@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::context_modifier::effort_to_string;
-use crate::shell::{ShellExecutionError, execute_shell_commands};
+use crate::shell::{ShellExecutionError, execute_shell_commands, execute_shell_commands_without_timeout};
 use crate::substitution::substitute_arguments;
 use crate::types::{ExecutionContext, SkillMetadata};
 use aion_types::spawner::{ForkOverrides, Spawner, SubAgentConfig};
@@ -19,6 +19,26 @@ pub async fn prepare_inline_content(
     args: Option<&str>,
     session_id: Option<&str>,
     cwd: &Path,
+) -> Result<String, ShellExecutionError> {
+    prepare_inline_content_policy(skill, args, session_id, cwd, false).await
+}
+
+/// Prepare inline content with no default deadline on embedded shell steps.
+pub async fn prepare_inline_content_without_timeout(
+    skill: &SkillMetadata,
+    args: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &Path,
+) -> Result<String, ShellExecutionError> {
+    prepare_inline_content_policy(skill, args, session_id, cwd, true).await
+}
+
+async fn prepare_inline_content_policy(
+    skill: &SkillMetadata,
+    args: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &Path,
+    managed: bool,
 ) -> Result<String, ShellExecutionError> {
     // Prepend base directory header so the model can resolve relative paths
     // (e.g. `./schemas/foo.json`). Matches TS `processPromptSlashCommand`.
@@ -38,7 +58,11 @@ pub async fn prepare_inline_content(
         session_id,
     );
 
-    execute_shell_commands(&substituted, skill.loaded_from, cwd).await
+    if managed {
+        execute_shell_commands_without_timeout(&substituted, skill.loaded_from, cwd).await
+    } else {
+        execute_shell_commands(&substituted, skill.loaded_from, cwd).await
+    }
 }
 
 /// Normalize path separators to forward slashes.
@@ -81,8 +105,30 @@ pub async fn execute_fork(
     cwd: &Path,
     spawner: &dyn Spawner,
 ) -> Result<String, String> {
+    execute_fork_policy(skill, args, session_id, cwd, spawner, false).await
+}
+
+/// Execute a fork skill without default deadlines on shell preparation.
+pub async fn execute_fork_without_timeout(
+    skill: &SkillMetadata,
+    args: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &Path,
+    spawner: &dyn Spawner,
+) -> Result<String, String> {
+    execute_fork_policy(skill, args, session_id, cwd, spawner, true).await
+}
+
+async fn execute_fork_policy(
+    skill: &SkillMetadata,
+    args: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &Path,
+    spawner: &dyn Spawner,
+    managed: bool,
+) -> Result<String, String> {
     // Prepare content (substitution + shell) — same pipeline as inline mode
-    let prompt = prepare_inline_content(skill, args, session_id, cwd)
+    let prompt = prepare_inline_content_policy(skill, args, session_id, cwd, managed)
         .await
         .map_err(|e: ShellExecutionError| e.to_string())?;
 

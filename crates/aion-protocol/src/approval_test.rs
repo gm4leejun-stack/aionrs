@@ -109,4 +109,29 @@ mod tests {
         assert!(mgr.is_auto_approved("exec"));
         assert!(!mgr.is_auto_approved("info")); // mode no longer provides this
     }
+
+    #[test]
+    fn cancelling_pending_approvals_invalidates_late_always_confirmation() {
+        let mgr = ToolApprovalManager::new();
+        let _receiver = mgr.request_approval("call-cancelled", &ToolCategory::Exec);
+
+        mgr.cancel_pending("call-cancelled");
+        mgr.approve("call-cancelled", ApprovalScope::Always);
+
+        assert!(!mgr.is_auto_approved("exec"));
+    }
+
+    #[test]
+    fn cancelling_all_pending_approvals_invalidates_each_request() {
+        let mgr = ToolApprovalManager::new();
+        let _first = mgr.request_approval("call-one", &ToolCategory::Exec);
+        let _second = mgr.request_approval("call-two", &ToolCategory::Edit);
+
+        mgr.cancel_all_pending();
+        mgr.approve("call-one", ApprovalScope::Always);
+        mgr.approve("call-two", ApprovalScope::Always);
+
+        assert!(!mgr.is_auto_approved("exec"));
+        assert!(!mgr.is_auto_approved("edit"));
+    }
 }

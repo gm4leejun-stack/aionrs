@@ -293,19 +293,30 @@ pub async fn execute_tool_calls_with_approval(
             && !approval_manager.is_auto_approved(&category.to_string());
 
         if needs_approval {
-            // Emit tool_request and wait for approval
-            let _ = writer.emit(&ProtocolEvent::ToolRequest {
-                msg_id: msg_id.to_string(),
-                call_id: id.clone(),
-                tool: ToolInfo {
-                    name: name.clone(),
-                    category,
-                    args: input.clone(),
-                    description,
-                },
-            });
-
+            // Register the receiver before publishing the request. Hosts may
+            // approve synchronously while handling ToolRequest; publishing
+            // first would let that approval race with registration and get
+            // silently dropped.
             let rx = approval_manager.request_approval(id, &category);
+            if writer
+                .emit(&ProtocolEvent::ToolRequest {
+                    msg_id: msg_id.to_string(),
+                    call_id: id.clone(),
+                    tool: ToolInfo {
+                        name: name.clone(),
+                        category,
+                        args: input.clone(),
+                        description,
+                    },
+                })
+                .is_err()
+            {
+                // Do not leave an orphaned pending request when the host
+                // cannot receive the approval event.
+                approval_manager.drop_pending(id);
+                return Err(ExecutionControl::Quit);
+            }
+
             match rx.await {
                 Ok(ToolApprovalResult::Approved) => { /* continue to execute */ }
                 Ok(ToolApprovalResult::Denied { reason }) => {

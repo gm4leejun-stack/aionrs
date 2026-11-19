@@ -75,6 +75,29 @@ mod tests {
     }
 
     #[test]
+    fn managed_execution_is_opt_in_and_reaches_registered_exec_command() {
+        let output: Arc<dyn OutputSink> = Arc::new(NullSink);
+        let legacy = AgentBootstrap::new(test_config(), "/tmp", output.clone());
+        let managed = AgentBootstrap::new(test_config(), "/tmp", output).managed_execution(true);
+        assert!(
+            legacy
+                .build_builtin_registry(Path::new("/tmp"))
+                .get("ExecCommand")
+                .unwrap()
+                .description()
+                .contains("default 120000")
+        );
+        assert!(
+            managed
+                .build_builtin_registry(Path::new("/tmp"))
+                .get("ExecCommand")
+                .unwrap()
+                .description()
+                .contains("no default wall-clock deadline")
+        );
+    }
+
+    #[test]
     fn mcp_servers_with_runtime_env_uses_server_env_as_override() {
         let mut config = test_config();
         config.mcp.servers.insert(
