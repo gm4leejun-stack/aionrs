@@ -5,6 +5,32 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn managed_timeout_policy_cannot_be_overridden_by_model_input() {
+        let managed = ExecCommandTool::new_managed(std::env::temp_dir());
+        let legacy = ExecCommandTool::new(std::env::temp_dir());
+        for input in [
+            json!({}),
+            json!({"timeout": 1}),
+            json!({"timeout": 600000}),
+            json!({"timeout": 900000}),
+        ] {
+            assert_eq!(managed.execution_timeout(&input), None);
+        }
+        assert_eq!(legacy.execution_timeout(&json!({})), Some(120000));
+        assert_eq!(legacy.execution_timeout(&json!({"timeout": 1})), Some(1));
+        assert_eq!(legacy.execution_timeout(&json!({"timeout": 900000})), Some(600000));
+        for text in ["--no-verify", "Prefer creating new commits", "make parallel tool calls"] {
+            assert!(managed.description().contains(text));
+        }
+        assert!(
+            managed.input_schema()["properties"]["timeout"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Ignored")
+        );
+    }
+
     #[tokio::test]
     async fn execute_echo_returns_stdout() {
         let tool = ExecCommandTool::new(std::env::temp_dir());
@@ -143,6 +169,21 @@ mod tests {
             "output after timeout should not be present, got: {}",
             result.content
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_constructor_ignores_model_timeout() {
+        let tool = ExecCommandTool::new_managed(std::env::temp_dir());
+        let result = tool
+            .execute(json!({"cmd": "sleep 0.2; printf managed_done", "timeout": 1}))
+            .await;
+        assert!(
+            !result.is_error,
+            "managed command should not use model timeout: {}",
+            result.content
+        );
+        assert!(result.content.contains("managed_done"), "got: {}", result.content);
     }
 
     #[cfg(windows)]

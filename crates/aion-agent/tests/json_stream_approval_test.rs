@@ -1,5 +1,6 @@
 mod common;
 
+use std::io;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -7,7 +8,9 @@ use serde_json::json;
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_agent::output::terminal::TerminalSink;
-use aion_protocol::writer::ProtocolWriter;
+use aion_protocol::commands::ApprovalScope;
+use aion_protocol::events::ProtocolEvent;
+use aion_protocol::writer::{ProtocolEmitter, ProtocolWriter};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aion_tools::registry::ToolRegistry;
 use aion_types::llm::LlmEvent;
@@ -25,6 +28,22 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
         output_tokens: output,
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
+    }
+}
+
+/// Approves synchronously from the ToolRequest emission callback. This catches
+/// a lost approval race where the event is emitted before the pending receiver
+/// is registered.
+struct ApproveOnToolRequest {
+    approvals: Arc<ToolApprovalManager>,
+}
+
+impl ProtocolEmitter for ApproveOnToolRequest {
+    fn emit(&self, event: &ProtocolEvent) -> io::Result<()> {
+        if let ProtocolEvent::ToolRequest { call_id, .. } = event {
+            self.approvals.approve(call_id, ApprovalScope::Once);
+        }
+        Ok(())
     }
 }
 
@@ -92,6 +111,53 @@ async fn test_tool_approval_approve_flow() {
     let result = engine.run("Use the tool", "msg-1").await.expect("should succeed");
     assert_eq!(result.text, "Done");
     assert_eq!(result.turns, 2);
+}
+
+#[tokio::test]
+async fn test_tool_request_registers_approval_before_emitting_event() {
+    let turn1 = vec![
+        LlmEvent::ToolUse {
+            id: "call-sync".to_string(),
+            name: "exec_tool".to_string(),
+            input: json!({}),
+            extra: None,
+        },
+        LlmEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: token_usage(80, 30),
+        },
+    ];
+    let turn2 = vec![
+        LlmEvent::TextDelta("Sync approval done".to_string()),
+        LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: token_usage(100, 50),
+        },
+    ];
+
+    let provider = Arc::new(MockLlmProvider::with_turns(vec![turn1, turn2]));
+    let mut config = test_config();
+    config.tools.auto_approve = false;
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ExecMockTool::new("exec_tool", "tool output")));
+
+    let output = silent_output();
+    let approval_manager = Arc::new(ToolApprovalManager::new());
+    let writer = Arc::new(ApproveOnToolRequest {
+        approvals: approval_manager.clone(),
+    });
+    let mut engine = AgentEngine::new_with_provider(provider, config, registry, output, std::env::temp_dir());
+    engine.set_approval_manager(approval_manager);
+    engine.set_protocol_writer(writer);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        engine.run("Use the tool", "msg-sync"),
+    )
+    .await
+    .expect("synchronous approval must not be lost")
+    .expect("engine should succeed");
+    assert_eq!(result.text, "Sync approval done");
 }
 
 // ---------------------------------------------------------------------------

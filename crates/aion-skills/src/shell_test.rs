@@ -1,5 +1,11 @@
 use super::*;
 
+#[test]
+fn managed_skill_shell_policy_has_no_default_deadline() {
+    assert_eq!(shell_timeout(false), Some(DEFAULT_TIMEOUT));
+    assert_eq!(shell_timeout(true), None);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

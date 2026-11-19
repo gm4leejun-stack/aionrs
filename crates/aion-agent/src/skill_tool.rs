@@ -8,7 +8,9 @@ use crate::spawner::Spawner;
 use aion_config::hooks::HooksConfig;
 use aion_protocol::events::ToolCategory;
 use aion_skills::context_modifier::ContextModifier;
-use aion_skills::executor::{execute_fork, prepare_inline_content};
+use aion_skills::executor::{
+    execute_fork, execute_fork_without_timeout, prepare_inline_content, prepare_inline_content_without_timeout,
+};
 use aion_skills::hooks::{parse_skill_hooks, to_hook_defs};
 use aion_skills::permissions::{SkillPermission, SkillPermissionChecker};
 use aion_skills::types::{ExecutionContext, SkillMetadata};
@@ -33,6 +35,7 @@ pub struct SkillTool {
     session_id: Option<String>,
     /// Spawner for fork-mode skills. None when SkillTool is built without fork support.
     spawner: Option<Arc<dyn Spawner>>,
+    managed_execution: bool,
 }
 
 impl SkillTool {
@@ -43,6 +46,7 @@ impl SkillTool {
             checker,
             session_id: None,
             spawner: None,
+            managed_execution: false,
         }
     }
 
@@ -59,6 +63,7 @@ impl SkillTool {
             checker,
             session_id,
             spawner: None,
+            managed_execution: false,
         }
     }
 
@@ -76,7 +81,13 @@ impl SkillTool {
             checker,
             session_id,
             spawner,
+            managed_execution: false,
         }
+    }
+
+    pub(crate) fn managed_execution(mut self, enabled: bool) -> Self {
+        self.managed_execution = enabled;
+        self
     }
 
     /// Find a skill by exact name (case-sensitive, leading `/` stripped).
@@ -174,7 +185,12 @@ impl Tool for SkillTool {
 
         match skill.execution_context {
             ExecutionContext::Inline => {
-                match prepare_inline_content(skill, args, self.session_id.as_deref(), &self.cwd).await {
+                let result = if self.managed_execution {
+                    prepare_inline_content_without_timeout(skill, args, self.session_id.as_deref(), &self.cwd).await
+                } else {
+                    prepare_inline_content(skill, args, self.session_id.as_deref(), &self.cwd).await
+                };
+                match result {
                     Ok(content) => ToolResult {
                         content,
                         is_error: false,
@@ -200,7 +216,12 @@ impl Tool for SkillTool {
                         };
                     }
                 };
-                match execute_fork(skill, args, self.session_id.as_deref(), &self.cwd, spawner).await {
+                let result = if self.managed_execution {
+                    execute_fork_without_timeout(skill, args, self.session_id.as_deref(), &self.cwd, spawner).await
+                } else {
+                    execute_fork(skill, args, self.session_id.as_deref(), &self.cwd, spawner).await
+                };
+                match result {
                     Ok(content) => ToolResult {
                         content,
                         is_error: false,

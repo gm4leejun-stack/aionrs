@@ -18,6 +18,8 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 pub struct ExecCommandTool {
     cwd: PathBuf,
     runtime_env: HashMap<String, String>,
+    managed: bool,
+    description: String,
 }
 
 impl ExecCommandTool {
@@ -25,6 +27,8 @@ impl ExecCommandTool {
         Self {
             cwd,
             runtime_env: HashMap::new(),
+            managed: false,
+            description: legacy_description().to_owned(),
         }
     }
 
@@ -32,8 +36,56 @@ impl ExecCommandTool {
         Self {
             cwd,
             runtime_env: runtime_env.into_iter().collect(),
+            managed: false,
+            description: legacy_description().to_owned(),
         }
     }
+
+    /// Create a host-managed command tool without a wall-clock deadline.
+    /// Model-provided timeout values cannot override the host policy.
+    pub fn new_managed(cwd: PathBuf) -> Self {
+        Self::new_with_env_managed(cwd, Vec::new())
+    }
+
+    /// Create a host-managed command tool with an injected environment.
+    pub fn new_with_env_managed(cwd: PathBuf, runtime_env: Vec<(String, String)>) -> Self {
+        Self {
+            managed: true,
+            description: legacy_description().replace(
+                "You may specify an optional timeout in milliseconds (default 120000, max 600000).",
+                "Host-managed execution has no default wall-clock deadline; the optional timeout argument is ignored by host policy.",
+            ),
+            ..Self::new_with_env(cwd, runtime_env)
+        }
+    }
+
+    fn execution_timeout(&self, input: &Value) -> Option<u64> {
+        (!self.managed).then(|| {
+            input["timeout"]
+                .as_u64()
+                .unwrap_or(DEFAULT_TIMEOUT_MS)
+                .min(MAX_TIMEOUT_MS)
+        })
+    }
+}
+
+fn legacy_description() -> &'static str {
+    "Executes a shell command and returns its output.\n\n\
+         IMPORTANT: Do NOT use ExecCommand when a dedicated tool is available:\n\
+         - File search: use Glob (not find or ls)\n\
+         - Content search: use Grep (not grep or rg)\n\
+         - Read files: use Read (not cat, head, or tail)\n\
+         - Edit files: use Edit (not sed or awk)\n\
+         - Write files: use Write (not echo or cat with heredoc)\n\n\
+         # Instructions\n\
+         - After a command fails, inspect its complete error or traceback and diagnose the cause before retrying. Do not repeat an unchanged failing command.\n\
+         - Use absolute paths to avoid working directory confusion.\n\
+         - When issuing multiple independent commands, make parallel tool calls \
+         instead of chaining them. Use `&&` only when commands depend on each other.\n\
+         - You may specify an optional timeout in milliseconds (default 120000, max 600000).\n\n\
+         # Git safety\n\
+         - Never force push, reset --hard, or use --no-verify unless explicitly asked.\n\
+         - Prefer creating new commits over amending existing ones."
 }
 
 fn render_exit_result(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> String {
@@ -55,22 +107,7 @@ impl Tool for ExecCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Executes a shell command and returns its output.\n\n\
-         IMPORTANT: Do NOT use ExecCommand when a dedicated tool is available:\n\
-         - File search: use Glob (not find or ls)\n\
-         - Content search: use Grep (not grep or rg)\n\
-         - Read files: use Read (not cat, head, or tail)\n\
-         - Edit files: use Edit (not sed or awk)\n\
-         - Write files: use Write (not echo or cat with heredoc)\n\n\
-         # Instructions\n\
-         - After a command fails, inspect its complete error or traceback and diagnose the cause before retrying. Do not repeat an unchanged failing command.\n\
-         - Use absolute paths to avoid working directory confusion.\n\
-         - When issuing multiple independent commands, make parallel tool calls \
-         instead of chaining them. Use `&&` only when commands depend on each other.\n\
-         - You may specify an optional timeout in milliseconds (default 120000, max 600000).\n\n\
-         # Git safety\n\
-         - Never force push, reset --hard, or use --no-verify unless explicitly asked.\n\
-         - Prefer creating new commits over amending existing ones."
+        &self.description
     }
 
     fn input_schema(&self) -> JsonSchema {
@@ -87,7 +124,11 @@ impl Tool for ExecCommandTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in milliseconds (default 120000, max 600000)"
+                    "description": if self.managed {
+                        "Ignored for host-managed execution; no wall-clock deadline is applied"
+                    } else {
+                        "Timeout in milliseconds (default 120000, max 600000)"
+                    }
                 }
             },
             "required": ["cmd"]
@@ -123,22 +164,26 @@ impl Tool for ExecCommandTool {
             "ExecCommandTool executing"
         );
 
-        let timeout_ms = input["timeout"]
-            .as_u64()
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .min(MAX_TIMEOUT_MS);
-
-        let timeout = Duration::from_millis(timeout_ms);
+        let timeout_ms = self.execution_timeout(&input);
 
         let cwd = self.cwd.clone();
         let mut command_builder = shell_command_builder(&shell, command, false);
         command_builder.envs(&self.runtime_env).current_dir(&cwd);
 
-        let result = CommandRunner::new(command_builder).timeout(timeout).run().await;
+        let runner = CommandRunner::new(command_builder);
+        let runner = match timeout_ms {
+            Some(milliseconds) => runner.timeout(Duration::from_millis(milliseconds)),
+            None => runner.without_timeout(),
+        };
+        let result = runner.run().await;
 
         match result {
             Ok(result) if result.timed_out => ToolResult {
-                content: render_timeout_result(timeout_ms, &result.stdout, &result.stderr),
+                content: render_timeout_result(
+                    timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+                    &result.stdout,
+                    &result.stderr,
+                ),
                 is_error: true,
             },
             Ok(result) => {
